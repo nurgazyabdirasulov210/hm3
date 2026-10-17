@@ -1,5 +1,5 @@
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
-import { OneEuro, clamp } from './filters.js';
+import { OneEuro, clamp, smoothstep } from './filters.js';
 
 const PALM = [0, 5, 9, 13, 17];
 const TIPS = [4, 8, 12, 16, 20];
@@ -23,6 +23,39 @@ const PINCH_MAX = 0.9;
 const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const THROW_WINDOW_MS = 120; // wrist velocity is measured over this window, so a single glitchy frame cannot fake a throw
+
+// Hand orientation from metric world landmarks, in mirrored scene space (x right, y up, z toward the viewer),
+// so rotations match what the user sees on screen.
+// up: unit wrist -> middle knuckle axis. flip: angle of the knuckle line around that axis, i.e. turning the hand over.
+// It does not change when the hand rotates in the screen plane, so it never doubles up with the in-plane twist.
+function orientation(w) {
+  const P = (i) => [-w[i].x, -w[i].y, -w[i].z];
+  const [wx, wy, wz] = P(0);
+  const [mx, my, mz] = P(9);
+  const [ix, iy, iz] = P(5);
+  const [px, py, pz] = P(17);
+  const ul = Math.hypot(mx - wx, my - wy, mz - wz) || 1;
+  const ux = (mx - wx) / ul;
+  const uy = (my - wy) / ul;
+  const uz = (mz - wz) / ul;
+  // e1 = camera axis x up (lies in the screen plane, across the hand); e2 = up x e1.
+  const el = Math.hypot(ux, uy) || 1e-6;
+  const e1x = -uy / el;
+  const e1y = ux / el;
+  const e2x = -uz * e1y;
+  const e2y = uz * e1x;
+  const e2z = ux * e1y - uy * e1x;
+  const ax = px - ix;
+  const ay = py - iy;
+  const az = pz - iz;
+  return {
+    up: { x: ux, y: uy, z: uz },
+    flip: Math.atan2(ax * e2x + ay * e2y + az * e2z, ax * e1x + ay * e1y),
+    // Unreliable when the hand points at the camera.
+    flipW: smoothstep(0.45, 0.75, el),
+  };
+}
 
 const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
 
@@ -69,13 +102,17 @@ class Track {
     this.hist = [];
     this.mask = d.mask;
     this.fingers = popcount(d.mask);
-    this.vx = this.vy = this.pvx = this.pvy = this.twist = this.openRate = 0;
-    this.px = this.py = null;
-    this.tipX = this.tipY = this.angle = null;
+    this.fwx = new OneEuro(2.0, 0.02);
+    this.fwy = new OneEuro(2.0, 0.02);
+    this.wrists = []; // recent filtered wrist positions { t, x, y }
+    this.vx = this.vy = this.pvx = this.pvy = this.twist = this.flip = this.openRate = 0;
+    this.tipX = this.tipY = this.angle = this.flipAngle = null;
     this.update(d, now);
   }
 
   update(d, now) {
+    // After a dropout the old wrist samples say nothing about the current motion.
+    if (now - this.t > 150) this.wrists.length = 0;
     const dt = Math.max(1 / 120, (now - this.t) / 1000);
     this.t = this.seen = now;
     this.rawX = d.x;
@@ -84,13 +121,24 @@ class Track {
     this.x = this.fx.filter(d.x, dt);
     this.y = this.fy.filter(d.y, dt);
     this.size = this.fs.filter(d.size, dt);
-    // Palm velocity (px/s), used to detect a throw.
-    if (this.px !== null) {
-      this.pvx += 0.5 * ((this.x - this.px) / dt - this.pvx);
-      this.pvy += 0.5 * ((this.y - this.py) / dt - this.pvy);
+    this.up = d.up;
+    this.twistW = d.twistW;
+    this.flipW = d.flipW;
+
+    // Wrist velocity (px/s), used to detect a throw. The wrist is the pivot of a twist or a flip,
+    // so turning the hand does not read as moving it.
+    const wx = this.fwx.filter(d.pts[0].x, dt);
+    const wy = this.fwy.filter(d.pts[0].y, dt);
+    this.wrists.push({ t: now, x: wx, y: wy });
+    while (this.wrists.length > 2 && now - this.wrists[1].t >= THROW_WINDOW_MS) this.wrists.shift();
+    const w0 = this.wrists[0];
+    const span = (now - w0.t) / 1000;
+    if (this.wrists.length < 2) {
+      this.pvx = this.pvy = 0;
+    } else if (span > 0.02) {
+      this.pvx += 0.6 * ((wx - w0.x) / span - this.pvx);
+      this.pvy += 0.6 * ((wy - w0.y) / span - this.pvy);
     }
-    this.px = this.x;
-    this.py = this.y;
 
     // Debounce: the finger mask switches only after 3 identical frames in a row.
     this.hist.push(d.mask);
@@ -110,10 +158,12 @@ class Track {
       this.vx += 0.6 * ((tx - this.tipX) / dt - this.vx);
       this.vy += 0.6 * ((ty - this.tipY) / dt - this.vy);
       this.twist += 0.5 * (wrapAngle(d.angle - this.angle) / dt - this.twist);
+      this.flip += 0.5 * (wrapAngle(d.flip - this.flipAngle) / dt - this.flip);
     }
     this.tipX = tx;
     this.tipY = ty;
     this.angle = d.angle;
+    this.flipAngle = d.flip;
   }
 }
 
@@ -152,21 +202,32 @@ export async function startTracking(video, view) {
       x += pts[i].x / PALM.length;
       y += pts[i].y / PALM.length;
     }
+    const size = Math.max(dist2(pts[0], pts[9]), dist2(pts[5], pts[17]) * 1.3);
     return {
+      ...orientation(world),
       pts,
       x,
       y,
-      size: Math.max(dist2(pts[0], pts[9]), dist2(pts[5], pts[17]) * 1.3),
+      size,
+      // The in-plane angle is noise when the wrist -> knuckle line is foreshortened (hand pointing at the camera).
+      twistW: smoothstep(0.35, 0.6, dist2(pts[0], pts[9]) / size),
       mask: fingerMask(world),
       open: openness(world),
       angle: Math.atan2(pts[9].y - pts[0].y, pts[9].x - pts[0].x),
     };
   }
 
-  const gap = (tr, d) => Math.hypot(d.x - tr.rawX, d.y - tr.rawY);
+  // Distance from where the track is expected to be now (last position carried along its velocity),
+  // so a hand that was flicked fast is found again where it landed.
+  let frameNow = 0;
+  const gap = (tr, d) => {
+    const ahead = Math.min(0.25, (frameNow - tr.seen) / 1000 + 0.03);
+    return Math.hypot(d.x - (tr.rawX + tr.pvx * ahead), d.y - (tr.rawY + tr.pvy * ahead));
+  };
   const near = (tr, d) => gap(tr, d) < Math.max(view.W * 0.25, tr.size * 3);
 
   function process(result, now) {
+    frameNow = now;
     const dets = result.landmarks.map((lm, i) => measure(lm, result.worldLandmarks[i]));
 
     // Keep identities by position: MediaPipe does not give stable hand ids.
@@ -185,7 +246,11 @@ export async function startTracking(video, view) {
       }
     }
     for (const d of dets) {
-      if (!lead) lead = new Track(d, now);
+      // A track that got nothing this frame and was moving fast is most likely this hand after a flick:
+      // there are never more than two hands, so it must not turn into a "new" one.
+      const lost = [lead, tool].find((tr) => tr && tr.seen !== now && Math.hypot(tr.pvx, tr.pvy) > 500);
+      if (lost) lost.update(d, now);
+      else if (!lead) lead = new Track(d, now);
       else if (!tool) tool = new Track(d, now);
     }
   }
@@ -219,6 +284,10 @@ export async function startTracking(video, view) {
     pvx: tr.pvx,
     pvy: tr.pvy,
     twist: tr.twist,
+    twistW: tr.twistW,
+    flip: tr.flip,
+    flipW: tr.flipW,
+    up: tr.up,
     fresh: now - tr.seen < 120,
   });
 

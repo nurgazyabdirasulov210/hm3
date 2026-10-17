@@ -20,6 +20,7 @@ Open the printed URL and allow camera access. `/?demo` drives the figure with a 
   - pinch or close the hand — shrink, open — grow;
   - fast index-finger flick — spin the figure (it keeps spinning by inertia);
   - twist the wrist — roll in the screen plane.
+- **Turning either hand turns the figure** (one hand or joined hands): twist it in the screen plane to roll the figure, turn it over (palm ↔ back) to spin the figure around the hand's axis. The figure keeps spinning afterwards and slows down, so a hard turn gives several revolutions.
 
 ## Modes
 
@@ -30,7 +31,7 @@ Open the printed URL and allow camera access. `/?demo` drives the figure with a 
 
 ## Throwing
 
-Flick the lead hand fast sideways and the figure flies off in that direction, spinning.
+Flick the lead hand fast sideways and the figure flies off in that direction, spinning. The flight is a smooth curve with no jumps in position or speed, from launch to landing, and it continues even if the camera briefly loses the hand mid-flick.
 - If your other hand is on that side, the figure flies to it and settles above it. That hand becomes the lead, the thrower becomes the tool (scale), and you can throw it back. The figure keeps its shape until the new lead hand changes gesture.
 - If there is no hand to catch it, it flies out, bounces off the screen edge and comes back to the hand it was thrown from.
 
