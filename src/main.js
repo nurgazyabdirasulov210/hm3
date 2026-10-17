@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { createFigure } from './figure.js';
+import { createSolids, SOLID_KEYS, MIDDLE } from './shapes.js';
+import { createPortal } from './portal.js';
 import { startTracking } from './hands.js';
 import { clamp, smoothstep } from './filters.js';
 
@@ -15,7 +17,16 @@ const CFG = {
   spinFriction: 0.7,
   spinGain: 0.84,
   maxBlur: 6,
+  // Distances between the two palms, in palm sizes. The gap between the thresholds is hysteresis.
+  joinAt: 2.0, // closer than this: hands joined
+  portalAt: 2.8, // joined, then pulled further apart than this: portal
+  leaveAt: 1.8, // portal, then brought closer than this: back to joined
 };
+
+const GLOW = { single: null, joined: new THREE.Color(0xb28dff), middle: new THREE.Color(0xff5a5a), portal: new THREE.Color(0xff9a2e) };
+const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
+// Only the middle finger up (the thumb is too unreliable to count).
+const isMiddle = (m) => (m & 4) !== 0 && (m & 0b11010) === 0;
 
 const video = document.getElementById('cam');
 const sceneCanvas = document.getElementById('scene');
@@ -30,6 +41,8 @@ renderer.setClearColor(0x000000, 0);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 1, 10000);
 const figure = createFigure(scene);
+const solids = createSolids(scene);
+const portal = createPortal(scene);
 
 function resize() {
   view.W = innerWidth;
@@ -45,6 +58,8 @@ function resize() {
   camera.position.set(view.W / 2, -view.H / 2, view.H / 2 / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
   camera.updateProjectionMatrix();
   figure.resize(view.W, view.H);
+  solids.resize(view.W, view.H);
+  portal.resize(view.W, view.H);
 }
 addEventListener('resize', resize);
 resize();
@@ -61,7 +76,13 @@ let popV = 0;
 let visibility = 0;
 let pulse = 0; // decaying kick after the shape changes
 let blur = 0;
-let sides = -1;
+let shapeKey = '';
+let mode = 'single'; // 'single' | 'joined' | 'portal'
+let vPrism = 0;
+let solidKey = null;
+let portalPts = null;
+let portalLevel = 0;
+const glow = new THREE.Color(0xc8d8ff);
 let spinY = 0;
 const omega = new THREE.Vector3();
 const qUser = new THREE.Quaternion();
@@ -74,14 +95,40 @@ const euler = new THREE.Euler();
 const Y = new THREE.Vector3(0, 1, 0);
 const poses = [];
 
+function nextMode(lead, tool) {
+  if (!lead || !tool?.fresh) return 'single';
+  const d = Math.hypot(lead.x - tool.x, lead.y - tool.y) / ((lead.size + tool.size) / 2);
+  if (mode === 'single') return d < CFG.joinAt ? 'joined' : 'single';
+  if (mode === 'joined') return d > CFG.portalAt ? 'portal' : 'joined';
+  return d < CFG.leaveAt ? 'joined' : 'portal';
+}
+
+// Four corners in loop order: two fingertips (thumb, index) of each hand.
+function portalCorners(lead, tool) {
+  const [lt, li, tt, ti] = [lead.pts[4], lead.pts[8], tool.pts[4], tool.pts[8]];
+  const parallel = (li.x - lt.x) * (ti.x - tt.x) + (li.y - lt.y) * (ti.y - tt.y) >= 0;
+  return parallel ? [lt, li, ti, tt] : [lt, li, tt, ti];
+}
+
 function step(input, dt, t) {
   const { lead, tool } = input;
+  mode = nextMode(lead, tool);
+  const joined = mode === 'joined';
+  const middle = mode === 'single' && !!lead && isMiddle(lead.mask);
+  portalPts = mode === 'portal' ? portalCorners(lead, tool) : null;
+  portalLevel = mode === 'portal' ? popcount(lead.mask & 0b11100) + popcount(tool.mask & 0b11100) : 0;
+  vPrism += ((mode === 'single' && !middle ? 1 : 0) - vPrism) * (1 - Math.exp(-10 * dt));
 
   if (lead) {
-    radius += (lead.size * CFG.radius - radius) * (1 - Math.exp(-10 * dt));
+    // Joined hands act as one: the figure hangs above the point between them.
+    const a = joined
+      ? { x: (lead.x + tool.x) / 2, y: (lead.y + tool.y) / 2, size: (lead.size + tool.size) / 2 }
+      : lead;
+    solidKey = joined ? SOLID_KEYS[Math.min(lead.fingers, 5)] : middle ? MIDDLE : null;
+    radius += (a.size * CFG.radius - radius) * (1 - Math.exp(-10 * dt));
     // Target: above the hand, with a small orbit and bob so it never sits dead still.
-    const tx = lead.x + Math.cos(t * 1.7) * lead.size * 0.12;
-    const ty = lead.y - lead.size * CFG.hover + Math.sin(t * 2.3) * lead.size * 0.08;
+    const tx = a.x + Math.cos(t * 1.7) * a.size * 0.12;
+    const ty = a.y - a.size * CFG.hover + Math.sin(t * 2.3) * a.size * 0.08;
     if (visibility < 0.05) {
       pos.x = tx;
       pos.y = ty;
@@ -92,11 +139,12 @@ function step(input, dt, t) {
     vel.y += (CFG.followK * (ty - pos.y) - CFG.followC * vel.y) * dt;
     visibility += (1 - visibility) * (1 - Math.exp(-8 * dt));
 
-    if (lead.fingers !== sides) {
-      const first = sides < 0;
-      sides = lead.fingers;
-      figure.setSides(sides);
-      if (!first) {
+    const key = mode === 'portal' ? 'portal' : joined ? `j${lead.fingers}` : middle ? 'm' : `s${lead.fingers}`;
+    if (key !== shapeKey) {
+      const first = shapeKey === '';
+      shapeKey = key;
+      if (mode === 'single' && !middle) figure.setSides(lead.fingers);
+      if (!first && mode !== 'portal') {
         pulse = 1;
         popV += 5;
         omega.y += 5;
@@ -109,7 +157,7 @@ function step(input, dt, t) {
   pos.x += vel.x * dt;
   pos.y += vel.y * dt;
 
-  if (tool?.fresh) {
+  if (mode === 'single' && tool?.fresh) {
     scaleTarget = CFG.scaleMin + (CFG.scaleMax - CFG.scaleMin) * tool.open;
     // Trackball: fast finger flicks drag the surface, slow return strokes barely touch it.
     // Ignored while the hand is opening/closing so scaling does not spin the figure.
@@ -122,6 +170,7 @@ function step(input, dt, t) {
     const kTwist = 1 - Math.exp(-14 * smoothstep(1, 5, Math.abs(tool.twist)) * steady * dt);
     omega.z += (-tool.twist * CFG.spinGain - omega.z) * kTwist;
   }
+  if (mode !== 'single') scaleTarget = 1;
   scaleV += (320 * (scaleTarget - scale) - 20 * scaleV) * dt;
   scale += scaleV * dt;
   popV += (260 * (1 - pop) - 14 * popV) * dt;
@@ -140,7 +189,7 @@ function step(input, dt, t) {
 }
 
 // Once per rendered frame: record the pose for the ghost trail and set the blur.
-function present(dt) {
+function present(dt, t) {
   const speed = Math.hypot(vel.x, vel.y);
   const spin = omega.length();
   const pose = poses.length > figure.ghosts ? poses.pop() : { q: new THREE.Quaternion() };
@@ -149,12 +198,17 @@ function present(dt) {
   pose.r = Math.max(1, radius * scale * pop);
   pose.q.copy(qBank).multiply(qUser).multiply(qTilt).multiply(qSpin);
   poses.unshift(pose);
-  figure.place(poses, visibility, clamp(speed / 700 + spin / 8 + pulse, 0, 1));
+  figure.place(poses, visibility * vPrism, clamp(speed / 700 + spin / 8 + pulse, 0, 1));
 
-  const blurTarget = clamp(speed / 450 + spin * 0.35 + Math.abs(scaleV) * 0.5 + pulse * 4, 0, CFG.maxBlur);
+  const target = GLOW[mode === 'portal' ? 'portal' : mode === 'joined' ? 'joined' : solidKey === MIDDLE ? 'middle' : 'single'] ?? figure.color;
+  glow.lerp(target, 1 - Math.exp(-8 * dt));
+  solids.place(solidKey, pose, visibility, glow, dt);
+  portal.update(portalPts, portalLevel, dt, t, GLOW.portal);
+
+  const blurTarget = clamp(speed / 450 + spin * 0.35 + Math.abs(scaleV) * 0.5 + pulse * 4, 0, CFG.maxBlur) * (mode === 'portal' ? 0.15 : 1);
   blur += (blurTarget - blur) * (1 - Math.exp(-18 * dt));
-  const glow = `drop-shadow(0 0 12px #${figure.color.getHexString()})`;
-  sceneCanvas.style.filter = blur > 0.25 ? `blur(${blur.toFixed(2)}px) ${glow}` : glow;
+  const glowCss = `drop-shadow(0 0 12px #${(mode === 'portal' ? GLOW.portal : glow).getHexString()})`;
+  sceneCanvas.style.filter = blur > 0.25 ? `blur(${blur.toFixed(2)}px) ${glowCss}` : glowCss;
 }
 
 // --- hand skeleton overlay --------------------------------------------------
@@ -184,25 +238,38 @@ function drawHands(hands) {
 
 // --- input ------------------------------------------------------------------
 // `?demo` drives the figure with a synthetic hand, to check rendering without a camera.
+function demoHand(x, y, mask, side) {
+  // Thumb and index tips sit on the inner side of the hand, like an "L" frame.
+  const pts = Array.from({ length: 21 }, () => ({ x, y }));
+  pts[4] = { x: x + side * 30, y: y + 60 };
+  pts[8] = { x: x + side * 30, y: y - 60 };
+  return { x, y, size: 110, fingers: popcount(mask), mask, pts };
+}
+
+// Cycle (24 s): prism figures, middle finger, joined hands, then the portal with growing mandala levels.
 function demoInput(t) {
-  const fast = Math.sin(t * 0.5) > 0.3 ? 2 : 0.6;
-  return {
-    lead: {
-      x: view.W / 2 + Math.sin(t * 1.1 * fast) * view.W * 0.25,
-      y: view.H * 0.7 + Math.cos(t * 0.8) * view.H * 0.08,
-      size: 110,
-      fingers: Math.floor(t / 2) % 6,
-    },
-    tool: t % 12 > 6 && {
-      open: 0.5 + 0.5 * Math.sin(t * 1.5),
-      openRate: 0.75 * Math.cos(t * 1.5),
-      vx: 700 * Math.sin(t * 2),
-      vy: 0,
-      twist: 0,
-      fresh: true,
-    },
-    hands: [],
-  };
+  const c = t % 24;
+  const cx = view.W / 2;
+  const cy = view.H * 0.7;
+  let lead;
+  let tool = null;
+  if (c < 4) {
+    lead = demoHand(cx + Math.sin(t * 1.1) * view.W * 0.25, cy, [0, 1, 3, 7, 15, 31][Math.floor(c * 1.5)], 1);
+    lead.fingers = Math.floor(c * 1.5);
+  } else if (c < 7) {
+    lead = demoHand(cx, cy, 4, 1);
+  } else if (c < 12) {
+    lead = demoHand(cx - 50, cy, [0, 1, 3, 7, 15, 31][Math.floor(c - 7)], 1);
+    tool = demoHand(cx + 50, cy, 0, -1);
+  } else {
+    const sep = Math.min(1, (c - 12) / 1.5);
+    const level = Math.floor((c - 12) / 1.7) % 7;
+    const mask = (n) => 0b00011 | (0b11100 >> (3 - Math.min(n, 3)) & 0b11100);
+    lead = demoHand(cx - 50 - 170 * sep, cy, mask(Math.min(level, 3)), 1);
+    tool = demoHand(cx + 50 + 170 * sep, cy, mask(Math.max(level - 3, 0)), -1);
+  }
+  if (tool) Object.assign(tool, { open: 1, openRate: 0, vx: 0, vy: 0, twist: 0, fresh: true });
+  return { lead, tool, hands: [] };
 }
 
 async function openCamera() {
@@ -235,7 +302,7 @@ async function main() {
     const dt = Math.min(rawDt, 0.05);
     const n = Math.max(1, Math.ceil(dt / (1 / 120)));
     for (let i = 0; i < n; i++) step(input, dt / n, now / 1000 - dt + ((i + 1) * dt) / n);
-    present(dt);
+    present(dt, now / 1000);
     renderer.render(scene, camera);
     drawHands(input.hands);
 
@@ -243,8 +310,9 @@ async function main() {
     if (frame++ % 10 === 0) {
       statusEl.style.opacity = input.lead ? 0 : 1;
       statusEl.textContent = 'Покажите руку в кадр';
+      const modeName = { single: 'одна рука', joined: 'руки вместе', portal: 'портал' }[mode];
       hud.textContent = input.lead
-        ? `ведущая рука: ${input.lead.fingers} · вторая рука: ${input.tool ? `масштаб ×${scale.toFixed(2)}` : 'нет'} · ${fps.toFixed(0)} fps`
+        ? `${modeName} · ведущая рука: ${input.lead.fingers} · вторая рука: ${input.tool ? `масштаб ×${scale.toFixed(2)}` : 'нет'} · ${fps.toFixed(0)} fps`
         : `${fps.toFixed(0)} fps`;
     }
   }

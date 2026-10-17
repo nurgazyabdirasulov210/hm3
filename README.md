@@ -21,7 +21,14 @@ Open the printed URL and allow camera access. `/?demo` drives the figure with a 
   - fast index-finger flick — spin the figure (it keeps spinning by inertia);
   - twist the wrist — roll in the screen plane.
 
+## Modes
+
+- **Middle finger only** (lead hand): the figure turns into a blocky wireframe fist with one raised finger.
+- **Both hands brought together**: a different set of solids, chosen by the number of raised fingers on the lead hand — 0 sphere, 1 tetrahedron, 2 octahedron, 3 icosahedron, 4 dodecahedron, 5 torus.
+- **Joined, then pulled slightly apart**: a flat square portal. Its corners are the thumb and index fingertips of each hand (two corners per hand). The other raised fingers (middle, ring, pinky, both hands summed, 0–6) add layers to the Doctor Strange style mandala: rings, rune ticks, hexagram, octagram, rotating outer arcs.
+- Bring the hands back together to return to the solids; drop a hand to return to the single-hand mode.
+
 ## Tuning
 
-- `CFG` in `src/main.js` — follow spring, hover height, scale range, spin, blur.
+- `CFG` in `src/main.js` — follow spring, hover height, scale range, spin, blur, and the join / portal distances.
 - Constants at the top of `src/hands.js` — gesture thresholds.

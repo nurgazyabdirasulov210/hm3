@@ -33,7 +33,7 @@ function perimeter(n, t, out) {
   return out;
 }
 
-function lineMaterial() {
+export function lineMaterial() {
   // MAX blending: overlapping segment caps and ghosts never add up into bright beads.
   return new LineMaterial({
     linewidth: 2.4,

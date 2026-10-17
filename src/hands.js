@@ -24,15 +24,20 @@ const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
 
+const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
+
+// Bitmask of raised fingers: bit 0 thumb, 1 index, 2 middle, 3 ring, 4 pinky.
 // Uses metric world landmarks, so the result does not depend on distance to the camera.
-function countFingers(w) {
-  let n = 0;
-  for (const [mcp, pip, tip] of FINGERS) {
-    if (dist3(w[tip], w[0]) > dist3(w[pip], w[0]) * 1.12 && dist3(w[tip], w[mcp]) > dist3(w[pip], w[mcp]) * 1.25) n++;
-  }
+function fingerMask(w) {
+  let m = 0;
+  FINGERS.forEach(([mcp, pip, tip], i) => {
+    if (dist3(w[tip], w[0]) > dist3(w[pip], w[0]) * 1.12 && dist3(w[tip], w[mcp]) > dist3(w[pip], w[mcp]) * 1.25) {
+      m |= 2 << i;
+    }
+  });
   // Thumb: stuck out when its tip is far from the pinky knuckle relative to palm width.
-  if (dist3(w[4], w[17]) > dist3(w[5], w[17]) * 1.4) n++;
-  return n;
+  if (dist3(w[4], w[17]) > dist3(w[5], w[17]) * 1.4) m |= 1;
+  return m;
 }
 
 function openness(w) {
@@ -62,7 +67,8 @@ class Track {
     this.ftx = new OneEuro(2.5, 0.02);
     this.fty = new OneEuro(2.5, 0.02);
     this.hist = [];
-    this.fingers = d.fingers;
+    this.mask = d.mask;
+    this.fingers = popcount(d.mask);
     this.vx = this.vy = this.twist = this.openRate = 0;
     this.tipX = this.tipY = this.angle = null;
     this.update(d, now);
@@ -78,10 +84,13 @@ class Track {
     this.y = this.fy.filter(d.y, dt);
     this.size = this.fs.filter(d.size, dt);
 
-    // Debounce: the finger count switches only after 3 identical frames in a row.
-    this.hist.push(d.fingers);
+    // Debounce: the finger mask switches only after 3 identical frames in a row.
+    this.hist.push(d.mask);
     if (this.hist.length > 3) this.hist.shift();
-    if (this.hist.length === 3 && this.hist.every((v) => v === d.fingers)) this.fingers = d.fingers;
+    if (this.hist.length === 3 && this.hist.every((v) => v === d.mask)) {
+      this.mask = d.mask;
+      this.fingers = popcount(d.mask);
+    }
 
     const open = this.fo.filter(d.open, dt);
     if (this.open !== undefined) this.openRate += 0.5 * ((open - this.open) / dt - this.openRate);
@@ -140,7 +149,7 @@ export async function startTracking(video, view) {
       x,
       y,
       size: Math.max(dist2(pts[0], pts[9]), dist2(pts[5], pts[17]) * 1.3),
-      fingers: countFingers(world),
+      mask: fingerMask(world),
       open: openness(world),
       angle: Math.atan2(pts[9].y - pts[0].y, pts[9].x - pts[0].x),
     };
@@ -192,8 +201,14 @@ export async function startTracking(video, view) {
     read(now) {
       expire(now);
       return {
-        lead: lead && { x: lead.x, y: lead.y, size: lead.size, fingers: lead.fingers },
+        lead: lead && { x: lead.x, y: lead.y, size: lead.size, fingers: lead.fingers, mask: lead.mask, pts: lead.pts },
         tool: tool && {
+          x: tool.x,
+          y: tool.y,
+          size: tool.size,
+          fingers: tool.fingers,
+          mask: tool.mask,
+          pts: tool.pts,
           open: tool.open,
           openRate: tool.openRate,
           vx: tool.vx,
