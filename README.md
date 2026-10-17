@@ -28,7 +28,13 @@ Open the printed URL and allow camera access. `/?demo` drives the figure with a 
 - **Joined, then pulled slightly apart**: a flat square portal. Its corners are the thumb and index fingertips of each hand (two corners per hand). The other raised fingers (middle, ring, pinky, both hands summed, 0–6) add layers to the Doctor Strange style mandala: rings, rune ticks, hexagram, octagram, rotating outer arcs.
 - Bring the hands back together to return to the solids; drop a hand to return to the single-hand mode.
 
+## Throwing
+
+Flick the lead hand fast sideways and the figure flies off in that direction, spinning.
+- If your other hand is on that side, the figure flies to it and settles above it. That hand becomes the lead, the thrower becomes the tool (scale), and you can throw it back. The figure keeps its shape until the new lead hand changes gesture.
+- If there is no hand to catch it, it flies out, bounces off the screen edge and comes back to the hand it was thrown from.
+
 ## Tuning
 
-- `CFG` in `src/main.js` — follow spring, hover height, scale range, spin, blur, and the join / portal distances.
+- `CFG` in `src/main.js` — follow spring, hover height, scale range, spin, blur, the join / portal distances, and `THROW` (flick sensitivity, flight and catch springs).
 - Constants at the top of `src/hands.js` — gesture thresholds.

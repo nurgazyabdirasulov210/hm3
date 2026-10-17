@@ -69,7 +69,8 @@ class Track {
     this.hist = [];
     this.mask = d.mask;
     this.fingers = popcount(d.mask);
-    this.vx = this.vy = this.twist = this.openRate = 0;
+    this.vx = this.vy = this.pvx = this.pvy = this.twist = this.openRate = 0;
+    this.px = this.py = null;
     this.tipX = this.tipY = this.angle = null;
     this.update(d, now);
   }
@@ -83,6 +84,13 @@ class Track {
     this.x = this.fx.filter(d.x, dt);
     this.y = this.fy.filter(d.y, dt);
     this.size = this.fs.filter(d.size, dt);
+    // Palm velocity (px/s), used to detect a throw.
+    if (this.px !== null) {
+      this.pvx += 0.5 * ((this.x - this.px) / dt - this.pvx);
+      this.pvy += 0.5 * ((this.y - this.py) / dt - this.pvy);
+    }
+    this.px = this.x;
+    this.py = this.y;
 
     // Debounce: the finger mask switches only after 3 identical frames in a row.
     this.hist.push(d.mask);
@@ -197,27 +205,35 @@ export async function startTracking(video, view) {
   };
   video.requestVideoFrameCallback(onFrame);
 
+  const snap = (tr, now) => ({
+    x: tr.x,
+    y: tr.y,
+    size: tr.size,
+    fingers: tr.fingers,
+    mask: tr.mask,
+    pts: tr.pts,
+    open: tr.open,
+    openRate: tr.openRate,
+    vx: tr.vx,
+    vy: tr.vy,
+    pvx: tr.pvx,
+    pvy: tr.pvy,
+    twist: tr.twist,
+    fresh: now - tr.seen < 120,
+  });
+
   return {
     read(now) {
       expire(now);
       return {
-        lead: lead && { x: lead.x, y: lead.y, size: lead.size, fingers: lead.fingers, mask: lead.mask, pts: lead.pts },
-        tool: tool && {
-          x: tool.x,
-          y: tool.y,
-          size: tool.size,
-          fingers: tool.fingers,
-          mask: tool.mask,
-          pts: tool.pts,
-          open: tool.open,
-          openRate: tool.openRate,
-          vx: tool.vx,
-          vy: tool.vy,
-          twist: tool.twist,
-          fresh: now - tool.seen < 120,
-        },
+        lead: lead && snap(lead, now),
+        tool: tool && snap(tool, now),
         hands: [lead, tool].filter(Boolean).map((tr) => tr.pts),
       };
+    },
+    // The hands trade roles: the figure now follows the former tool.
+    swap() {
+      [lead, tool] = [tool, lead];
     },
   };
 }
