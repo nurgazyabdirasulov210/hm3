@@ -13,6 +13,7 @@ const FINGERS = [
 
 export const LEAD_GRACE_MS = 500; // lead survives short detection dropouts
 export const TOOL_GRACE_MS = 300;
+const FAST = 500; // px/s: a lost hand moving faster than this is looked for ahead along its motion
 // Openness (mean fingertip distance from palm centre / palm length) of a fist and of a spread hand.
 // The ranges are deliberately narrower than the full motion, so a partial squeeze already covers the whole scale.
 const OPEN_MIN = 0.65;
@@ -24,8 +25,63 @@ const PINCH_MAX = 0.9;
 const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
-// Wrist velocity is measured over this window, so a single glitchy frame cannot fake a throw.
-export const THROW_WINDOW_MS = 120;
+// Wrist velocity (the throw detector's input) is a straight-line fit over the last WRIST_SAMPLES raw wrist
+// positions no older than THROW_WINDOW_MS: 4 samples = 100 ms at 30 fps.
+export const THROW_WINDOW_MS = 150;
+const WRIST_SAMPLES = 4;
+// A wrist sample this far (in palm sizes) off the line through the others is a landmark glitch and is left out.
+// Real motion stays inside it: even a 2600 px/s flick bends the path by ~0.25 palm sizes over the window.
+const GLITCH = 0.3;
+
+// Least-squares line through samples { t (ms), x, y }: velocity (px/s) and position at time t.
+function fitLine(s) {
+  let tm = 0;
+  let xm = 0;
+  let ym = 0;
+  for (const p of s) {
+    tm += p.t / s.length;
+    xm += p.x / s.length;
+    ym += p.y / s.length;
+  }
+  let tt = 0;
+  let tx = 0;
+  let ty = 0;
+  for (const p of s) {
+    tt += (p.t - tm) ** 2;
+    tx += (p.t - tm) * (p.x - xm);
+    ty += (p.t - tm) * (p.y - ym);
+  }
+  const vx = tt ? tx / tt : 0;
+  const vy = tt ? ty / tt : 0;
+  return { vx: vx * 1000, vy: vy * 1000, at: (t) => ({ x: xm + vx * (t - tm), y: ym + vy * (t - tm) }) };
+}
+
+// Wrist velocity from raw (unfiltered) samples. Any smoothing filter in front of the slope lags behind a
+// 150 ms flick, which made the old estimate read ~0.84x the true peak; the slope of a line fitted over ~100 ms
+// has no bias for steady motion, reads ~0.93x the peak of a short flick (it averages the speed over the
+// window) and averages the landmark noise down to ~20 px/s. With 4+ samples, a sample that the line through
+// the others misses by more than GLITCH palm sizes is dropped, so a single bad frame cannot fake a throw
+// (a smaller glitch shifts the reading by at most ~9 px/s per px, < 600 px/s).
+function wristVelocity(s, size) {
+  if (s.length < 2) return { vx: 0, vy: 0 };
+  if (s.length >= 4) {
+    // The suspect is the sample whose removal leaves the straightest line through the rest.
+    let best = null;
+    s.forEach((p, i) => {
+      const rest = s.filter((_, j) => j !== i);
+      const fit = fitLine(rest);
+      let spread = 0;
+      for (const r of rest) {
+        const q = fit.at(r.t);
+        spread += Math.hypot(r.x - q.x, r.y - q.y);
+      }
+      if (!best || spread < best.spread) best = { fit, spread, p };
+    });
+    const q = best.fit.at(best.p.t);
+    if (Math.hypot(best.p.x - q.x, best.p.y - q.y) > GLITCH * size) return best.fit;
+  }
+  return fitLine(s);
+}
 
 // Hand orientation from metric world landmarks, in mirrored scene space (x right, y up, z toward the viewer),
 // so rotations match what the user sees on screen.
@@ -104,17 +160,13 @@ class Track {
     this.hist = [];
     this.mask = d.mask;
     this.fingers = popcount(d.mask);
-    this.fwx = new OneEuro(2.0, 0.02);
-    this.fwy = new OneEuro(2.0, 0.02);
-    this.wrists = []; // recent filtered wrist positions { t, x, y }
+    this.wrists = []; // recent raw wrist positions { t, x, y }
     this.vx = this.vy = this.pvx = this.pvy = this.twist = this.flip = this.openRate = 0;
     this.tipX = this.tipY = this.angle = this.flipAngle = null;
     this.update(d, now);
   }
 
   update(d, now) {
-    // After a dropout the old wrist samples say nothing about the current motion.
-    if (now - this.t > 150) this.wrists.length = 0;
     const dt = Math.max(1 / 120, (now - this.t) / 1000);
     this.t = this.seen = now;
     this.rawX = d.x;
@@ -127,20 +179,13 @@ class Track {
     this.twistW = d.twistW;
     this.flipW = d.flipW;
 
-    // Wrist velocity (px/s), used to detect a throw. The wrist is the pivot of a twist or a flip,
-    // so turning the hand does not read as moving it.
-    const wx = this.fwx.filter(d.pts[0].x, dt);
-    const wy = this.fwy.filter(d.pts[0].y, dt);
-    this.wrists.push({ t: now, x: wx, y: wy });
-    while (this.wrists.length > 2 && now - this.wrists[1].t >= THROW_WINDOW_MS) this.wrists.shift();
-    const w0 = this.wrists[0];
-    const span = (now - w0.t) / 1000;
-    if (this.wrists.length < 2) {
-      this.pvx = this.pvy = 0;
-    } else if (span > 0.02) {
-      this.pvx += 0.6 * ((wx - w0.x) / span - this.pvx);
-      this.pvy += 0.6 * ((wy - w0.y) / span - this.pvy);
-    }
+    // Wrist velocity (px/s), used to detect a throw (see wristVelocity). The wrist is the pivot of a twist
+    // or a flip, so turning the hand does not read as moving it.
+    this.wrists.push({ t: now, x: d.pts[0].x, y: d.pts[0].y });
+    while (this.wrists.length > WRIST_SAMPLES || now - this.wrists[0].t > THROW_WINDOW_MS) this.wrists.shift();
+    const v = wristVelocity(this.wrists, this.size);
+    this.pvx = v.vx;
+    this.pvy = v.vy;
 
     // Debounce: the finger mask switches only after 3 identical frames in a row.
     this.hist.push(d.mask);
@@ -209,42 +254,72 @@ export function createTracker(view, toPx) {
     };
   }
 
-  // Distance from where the track is expected to be now (last position carried along its velocity),
+  // Where the track is expected to be now: its last position carried along the wrist velocity,
   // so a hand that was flicked fast is found again where it landed.
   let frameNow = 0;
+  let lastFrame = -Infinity; // time of the previous camera frame
+  const lostFor = (tr) => (frameNow - tr.seen) / 1000; // s since the track last got a detection
   const gap = (tr, d) => {
-    const ahead = Math.min(0.25, (frameNow - tr.seen) / 1000 + 0.03);
+    const ahead = Math.min(0.25, lostFor(tr));
     return Math.hypot(d.x - (tr.rawX + tr.pvx * ahead), d.y - (tr.rawY + tr.pvy * ahead));
   };
-  const near = (tr, d) => gap(tr, d) < Math.max(view.W * 0.25, tr.size * 3);
+  // How far from that prediction a lone detection may be and still count as this hand: two palm sizes on an
+  // ordinary frame, growing while the hand is lost, faster for a hand that was moving fast.
+  const gate = (tr) => tr.size * 2 + (Math.hypot(tr.pvx, tr.pvy) * 0.5 + tr.size * 3) * lostFor(tr);
+  // A fast hand the camera lost (motion blur in a flick) is re-acquired anywhere ahead along its motion,
+  // up to where it could have got by now, instead of turning into a second hand.
+  const reacquire = (tr, d) => {
+    const v = Math.hypot(tr.pvx, tr.pvy);
+    if (v < FAST) return false;
+    const dx = d.x - tr.rawX;
+    const dy = d.y - tr.rawY;
+    const along = (dx * tr.pvx + dy * tr.pvy) / v;
+    const across = Math.abs(dx * tr.pvy - dy * tr.pvx) / v;
+    return along > 0 && along < v * (lostFor(tr) + 0.2) + tr.size && across < tr.size * 1.5;
+  };
+  // Cost of giving a lone detection to a track: distance from its prediction, plus a palm size for a track
+  // that missed the previous frame (its prediction is a guess), so a hand that is being tracked keeps it.
+  const cost = (tr, d) => gap(tr, d) + (tr.seen < lastFrame ? tr.size : 0);
 
   function process(result, now) {
+    expire(now);
     frameNow = now;
     const dets = result.landmarks.map((lm, i) => measure(lm, result.worldLandmarks[i]));
 
     // Keep identities by position: MediaPipe does not give stable hand ids.
-    if (lead && tool && dets.length === 2) {
+    if (dets.length >= 2) {
+      // Both hands in view, and there are never more than two: every track is one of them,
+      // paired up so that the total distance from the predictions is smallest.
       const [a, b] = dets;
-      const straight = gap(lead, a) + gap(tool, b) <= gap(lead, b) + gap(tool, a);
-      lead.update(straight ? a : b, now);
-      tool.update(straight ? b : a, now);
-      dets.length = 0;
-    } else {
+      if (lead && tool) {
+        const straight = gap(lead, a) + gap(tool, b) <= gap(lead, b) + gap(tool, a);
+        lead.update(straight ? a : b, now);
+        tool.update(straight ? b : a, now);
+        dets.length = 0;
+      } else if (lead || tool) {
+        const tr = lead || tool;
+        tr.update(dets.splice(gap(tr, a) <= gap(tr, b) ? 0 : 1, 1)[0], now);
+      }
+    } else if (dets.length === 1) {
+      // One hand in view: it goes to the track it fits best, and only to a track it plausibly is.
+      // A lost track never takes a detection sitting where the other, still tracked, hand is.
+      const d = dets[0];
+      let best = null;
       for (const tr of [lead, tool]) {
-        if (!tr || !dets.length) continue;
-        let best = 0;
-        for (let i = 1; i < dets.length; i++) if (gap(tr, dets[i]) < gap(tr, dets[best])) best = i;
-        if (near(tr, dets[best])) tr.update(dets.splice(best, 1)[0], now);
+        if (!tr || !(gap(tr, d) < gate(tr) || reacquire(tr, d))) continue;
+        if (!best || cost(tr, d) < cost(best, d)) best = tr;
+      }
+      if (best) {
+        best.update(d, now);
+        dets.length = 0;
       }
     }
+    // A detection no track claims is a hand entering the frame.
     for (const d of dets) {
-      // A track that got nothing this frame and was moving fast is most likely this hand after a flick:
-      // there are never more than two hands, so it must not turn into a "new" one.
-      const lost = [lead, tool].find((tr) => tr && tr.seen !== now && Math.hypot(tr.pvx, tr.pvy) > 500);
-      if (lost) lost.update(d, now);
-      else if (!lead) lead = new Track(d, now);
+      if (!lead) lead = new Track(d, now);
       else if (!tool) tool = new Track(d, now);
     }
+    lastFrame = now;
   }
 
   function expire(now) {

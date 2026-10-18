@@ -21,15 +21,19 @@ export const CFG = {
   joinAt: 2.0, // closer than this: hands joined
   portalAt: 2.8, // joined, then pulled further apart than this: portal
   leaveAt: 1.8, // portal, then brought closer than this: back to joined
+  // A flick toward the other hand also brings the hands close for a moment: they only count as joined
+  // once they have stayed close this long, with both wrists slower than joinSpeed (palm sizes per second).
+  joinDwell: 0.25, // s
+  joinSpeed: 3,
 };
 
 // Throwing the figure: a fast sideways flick of the lead hand sends it flying.
 // The flight is a chain of smooth legs (cubic Hermite curves): position and velocity stay continuous
-// from launch to landing, and each leg ends at rest on its target, so the hand-off back to the
+// from launch to landing, and each leg ends on its target moving with it, so the hand-off back to the
 // follow spring is seamless too.
 export const THROW = {
-  speed: 9, // wrist speed that counts as a flick, in palm sizes per second...
-  minSpeed: 900, // ...and never below this, px/s
+  speed: 5, // wrist speed that counts as a flick, in palm sizes per second (1000 px/s for a 200 px palm)...
+  minSpeed: 900, // ...and never below this, px/s (a single glitchy frame can read ~560 px/s)
   ratio: 1.6, // sideways speed must beat vertical speed by this factor
   launchMin: 900, // px/s
   launchMax: 1600,
@@ -40,7 +44,8 @@ export const THROW = {
   lift: 0.35, // upward arc: initial vertical speed as a fraction of the horizontal one
   boost: 30000, // px/s^2, launch acceleration: reaches full speed in ~50 ms without a jump
   spin: 11, // rad/s while flying
-  cooldown: 0.7, // s after a landing before the next throw
+  track: 10, // rad/s, critically damped follower of a leg's end point: the hand only moves at camera rate
+  cooldown: 0.5, // s after a landing before the next throw
 };
 
 export const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
@@ -70,8 +75,9 @@ export function createSim({ view, figure }) {
   let mode = 'single'; // 'single' | 'joined' | 'portal'
   let vPrism = 0;
   let solidKey = null;
-  let flight = null; // { dir, speed, phase: 'out' | 'home' | 'back', leg, outX, outY }
+  let flight = null; // { dir, speed, phase: 'out' | 'home' | 'back', out, boost, leg, end }
   let cooldown = 0;
+  let joinWait = 0; // how long the hands have been held close and steady
   let middle = false;
   let lastAnchor = null; // where the figure would rest, kept while the hand is briefly lost mid-flight
   let scaleHeld = 1; // after a catch the scale eases from this value to what the new tool hand says
@@ -89,11 +95,20 @@ export function createSim({ view, figure }) {
   const euler = new THREE.Euler();
   const Y = new THREE.Vector3(0, 1, 0);
 
-  function nextMode(lead, tool) {
+  function nextMode(lead, tool, dt) {
     // A tool that is briefly missing (inside its grace period) keeps the mode, so it does not flicker.
-    if (!lead || !tool) return 'single';
-    const d = Math.hypot(lead.x - tool.x, lead.y - tool.y) / ((lead.size + tool.size) / 2);
-    if (mode === 'single') return d < CFG.joinAt ? 'joined' : 'single';
+    if (!lead || !tool) {
+      joinWait = 0;
+      return 'single';
+    }
+    const palm = (lead.size + tool.size) / 2;
+    const d = Math.hypot(lead.x - tool.x, lead.y - tool.y) / palm;
+    if (mode === 'single') {
+      // Not while a wrist moves fast (a throw wins over joining) or right after a landing.
+      const slow = Math.max(Math.hypot(lead.pvx, lead.pvy), Math.hypot(tool.pvx, tool.pvy)) < CFG.joinSpeed * palm;
+      joinWait = d < CFG.joinAt && slow && !cooldown ? joinWait + dt : 0;
+      return joinWait >= CFG.joinDwell ? 'joined' : 'single';
+    }
     if (mode === 'joined') return d > CFG.portalAt ? 'portal' : 'joined';
     return d < CFG.leaveAt ? 'joined' : 'portal';
   }
@@ -105,32 +120,44 @@ export function createSim({ view, figure }) {
     return parallel ? [lt, li, ti, tt] : [lt, li, tt, ti];
   }
 
-  // Starts a flight leg from the current position and velocity, so velocity never jumps between legs.
-  // A fast approach gets a shorter leg, so the curve does not overshoot its target.
-  function startLeg(vx, vy, ex, ey) {
-    const d = Math.hypot(ex - pos.x, ey - pos.y);
+  // Starts a flight leg toward goal { x, y } from the current position and velocity, so velocity never
+  // jumps between legs. A fast approach gets a shorter leg, so the curve does not overshoot its target.
+  // The curve is laid out relative to its end point, which starts on the goal and then follows it (track):
+  // when the goal moves, the curve moves with it instead of stretching.
+  function startLeg(goal) {
+    const d = Math.hypot(goal.x - pos.x, goal.y - pos.y);
     let T = clamp(d / (THROW.cruise * flight.speed), THROW.legMin, THROW.legMax);
-    const along = d > 1 ? (vx * (ex - pos.x) + vy * (ey - pos.y)) / d : 0;
+    const along = d > 1 ? (vel.x * (goal.x - pos.x) + vel.y * (goal.y - pos.y)) / d : 0;
     if (along > 0) T = Math.max(0.15, Math.min(T, (1.4 * d) / along));
-    flight.leg = { x0: pos.x, y0: pos.y, vx, vy, T, t: 0 };
+    flight.leg = { rx: pos.x - goal.x, ry: pos.y - goal.y, vx: vel.x, vy: vel.y, T, t: 0 };
+    flight.end = { x: goal.x, y: goal.y, vx: 0, vy: 0 };
   }
 
-  // Advances the leg towards a (possibly moving) end point; sets pos and vel. Returns true at the end.
-  function legStep(L, ex, ey, dt) {
+  // The live goal (above a hand) only moves at the 30 fps camera rate, in steps: the leg's end point
+  // follows it with a critically damped spring, so it moves smoothly and the figure never jumps.
+  function track(e, goal, dt) {
+    const w = THROW.track;
+    e.vx += (w * w * (goal.x - e.x) - 2 * w * e.vx) * dt;
+    e.vy += (w * w * (goal.y - e.y) - 2 * w * e.vy) * dt;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+  }
+
+  // Advances the leg toward its moving end point e { x, y, vx, vy }: the offset from e shrinks from
+  // (rx, ry) to zero along the curve. Sets pos and vel; returns true at the end.
+  function legStep(L, e, dt) {
     L.t = Math.min(L.t + dt, L.T);
     const s = L.t / L.T;
     const s2 = s * s;
     const s3 = s2 * s;
     const h00 = 2 * s3 - 3 * s2 + 1;
     const h10 = (s3 - 2 * s2 + s) * L.T;
-    const h01 = 3 * s2 - 2 * s3;
     const d00 = (6 * s2 - 6 * s) / L.T;
     const d10 = 3 * s2 - 4 * s + 1;
-    const d01 = (6 * s - 6 * s2) / L.T;
-    pos.x = h00 * L.x0 + h10 * L.vx + h01 * ex;
-    pos.y = h00 * L.y0 + h10 * L.vy + h01 * ey;
-    vel.x = d00 * L.x0 + d10 * L.vx + d01 * ex;
-    vel.y = d00 * L.y0 + d10 * L.vy + d01 * ey;
+    pos.x = e.x + h00 * L.rx + h10 * L.vx;
+    pos.y = e.y + h00 * L.ry + h10 * L.vy;
+    vel.x = e.vx + d00 * L.rx + d10 * L.vx;
+    vel.y = e.vy + d00 * L.ry + d10 * L.vy;
     return s >= 1;
   }
 
@@ -138,18 +165,19 @@ export function createSim({ view, figure }) {
 
   function launch(lead, tool) {
     const dir = Math.sign(lead.pvx);
-    const speed = clamp(Math.abs(lead.pvx) * 0.9, THROW.launchMin, THROW.launchMax);
+    const speed = clamp(Math.abs(lead.pvx), THROW.launchMin, THROW.launchMax);
     const m = radius * scale * 1.2;
     flight = {
       dir,
       speed,
       phase: tool && (tool.x - pos.x) * dir > 0 ? 'home' : 'out',
-      outX: clamp(pos.x + dir * view.W * THROW.reach, m, view.W - m),
-      outY: pos.y,
+      out: { x: clamp(pos.x + dir * view.W * THROW.reach, m, view.W - m), y: pos.y },
       // Launch: speed up to the throw velocity with a bounded acceleration, then follow the curve.
       boost: { x: dir * speed, y: -speed * THROW.lift },
       leg: null,
+      end: null,
     };
+    joinWait = 0;
   }
 
   // One flight step. Returns 'caught' when the other hand has taken the figure.
@@ -158,13 +186,13 @@ export function createSim({ view, figure }) {
     // A hand showing up on the far side catches the figure; a catcher that disappears sends it back.
     if (f.phase === 'out' && tool && (tool.x - pos.x) * f.dir > 0) {
       f.phase = 'home';
-      if (f.leg) startLeg(vel.x, vel.y, restOver(tool).x, restOver(tool).y);
+      if (f.leg) startLeg(restOver(tool));
     } else if (f.phase === 'home' && !tool) {
       f.phase = 'back';
-      if (f.leg) startLeg(vel.x, vel.y, rest.x, rest.y);
+      if (f.leg) startLeg(rest);
     }
     omega.y += (f.dir * THROW.spin - omega.y) * (1 - Math.exp(-5 * dt));
-    const end = f.phase === 'home' ? restOver(tool) : f.phase === 'out' ? { x: f.outX, y: f.outY } : rest;
+    const goal = f.phase === 'home' ? restOver(tool) : f.phase === 'out' ? f.out : rest;
 
     if (f.boost) {
       const dvx = f.boost.x - vel.x;
@@ -177,16 +205,17 @@ export function createSim({ view, figure }) {
       pos.y += vel.y * dt;
       if (k === 1) {
         f.boost = null;
-        startLeg(vel.x, vel.y, end.x, end.y);
+        startLeg(goal);
       }
       return null;
     }
 
-    if (!legStep(f.leg, end.x, end.y, dt)) return null;
+    track(f.end, goal, dt);
+    if (!legStep(f.leg, f.end, dt)) return null;
     if (f.phase === 'out') {
       // Reached the far point: boomerang back to the hand that threw it.
       f.phase = 'back';
-      startLeg(0, 0, rest.x, rest.y);
+      startLeg(rest);
       return null;
     }
     flight = null;
@@ -213,7 +242,7 @@ export function createSim({ view, figure }) {
     cooldown = Math.max(0, cooldown - dt);
     // While the figure is in the air nothing else changes: no mode switches, no morphs.
     if (!flight) {
-      mode = nextMode(lead, tool);
+      mode = nextMode(lead, tool, dt);
       // After a catch the figure keeps its shape until the catching hand changes its gesture.
       if (shapeLock && (!lead || lead.mask !== shapeLock.mask || mode !== 'single')) shapeLock = null;
       if (!shapeLock) {
@@ -271,10 +300,8 @@ export function createSim({ view, figure }) {
           lead.fresh &&
           Math.abs(lead.pvx) > Math.max(THROW.minSpeed, lead.size * THROW.speed) &&
           Math.abs(lead.pvx) > Math.abs(lead.pvy) * THROW.ratio;
-        // Bringing the hands together fast is joining them, not a throw.
-        const close =
-          tool && Math.hypot(lead.x - tool.x, lead.y - tool.y) < CFG.portalAt * (lead.size + tool.size) * 0.5;
-        if (mode === 'single' && !cooldown && visibility > 0.5 && flick && !close) {
+        // A flick toward a nearby other hand is a throw too: joining needs the hands held close (see nextMode).
+        if (mode === 'single' && !cooldown && visibility > 0.5 && flick) {
           launch(lead, tool);
         }
       }

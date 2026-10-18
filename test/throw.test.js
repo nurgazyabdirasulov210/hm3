@@ -54,19 +54,12 @@ function assertCatch(t, r, { sep, t0, from, to }) {
   assert.equal(settled.shapeKey, shapeBefore, 'shape is kept after the catch');
 }
 
-test('a. throw to the other hand (realistic: 520 px apart, 1700 px/s flick, 2 dropped frames)', {
-  todo: 'blocked: the tracker sees ~0.83x the true wrist peak (< max(900, 9 * palm) = 1800 px/s), the `close` gate '
-    + '(other hand within portalAt * palm = 560 px) and the mode switching to joined as the hand approaches; '
-    + 'with dropped frames the lead track also grabs the other hand (see h)',
-}, (t) => {
+test('a. throw to the other hand (realistic: 520 px apart, 1700 px/s flick, 2 dropped frames)', (t) => {
   const r = throwScene(REAL);
   assertCatch(t, r, { sep: REAL.sep, t0: T0, from: 0, to: 1 });
 });
 
-test('a1. throw to the other hand (realistic, no dropped frames)', {
-  todo: 'blocked: the tracker sees ~0.83x the true wrist peak (~1410 for 1700 px/s, threshold 1800 px/s); by the time '
-    + 'the wrist is fast the hands are within the `close` gate (560 px) and the mode has switched to joined',
-}, (t) => {
+test('a1. throw to the other hand (realistic, no dropped frames)', (t) => {
   const r = throwScene({ ...REAL, drops: 0 });
   assertCatch(t, r, { sep: REAL.sep, t0: T0, from: 0, to: 1 });
 });
@@ -76,9 +69,7 @@ test('a2. throw to the other hand (hard: 1000 px apart, 2600 px/s flick)', (t) =
   assertCatch(t, r, { sep: HARD.sep, t0: T0, from: 0, to: 1 });
 });
 
-test('b. throw back right after the cooldown (realistic)', {
-  todo: 'the first throw (a) never launches, so there is nothing to throw back',
-}, (t) => {
+test('b. throw back right after the cooldown (realistic)', (t) => {
   const r = throwScene(REAL, { back: true });
   assertCatch(t, r, { sep: REAL.sep, t0: T0, from: 0, to: 1 });
   assertCatch(t, r, { sep: REAL.sep, t0: T1, from: 1, to: 0 });
@@ -88,6 +79,20 @@ test('b2. throw back right after the cooldown (hard)', (t) => {
   const r = throwScene(HARD, { back: true });
   assertCatch(t, r, { sep: HARD.sep, t0: T0, from: 0, to: 1 });
   assertCatch(t, r, { sep: HARD.sep, t0: T1, from: 1, to: 0 });
+});
+
+test('b3. throw back and forth 4 times in a row (realistic flicks, one every 1.6 s)', (t) => {
+  const every = 1.6;
+  const starts = [0, 1, 2, 3].map((k) => T0 + k * every);
+  // Throw k comes from hand k % 2 toward the other one.
+  const motions = [0, 1].map((i) => {
+    const own = starts.filter((_, k) => k % 2 === i).map((t0) => throwMotion({ t0, peak: REAL.peak, dir: i ? -1 : 1 }));
+    return (tt) => own.reduce((sum, m) => sum + m(tt), 0);
+  });
+  const r = run({ duration: T0 + 4 * every + 0.5, seed: 11, hands: twoHands({ sep: REAL.sep, motions }) });
+  assert.equal(flights(r.log).length, 4, 'exactly one flight per flick');
+  starts.forEach((t0, k) => assertCatch(t, r, { sep: REAL.sep, t0, from: k % 2, to: 1 - (k % 2) }));
+  assertSmooth(t, r);
 });
 
 /** Asserts a boomerang throw: out, back, resting above the throwing hand again. */
@@ -108,9 +113,7 @@ function assertBoomerang(t, r) {
   assert.ok(off < 0.4 * SIZE, `rests above the throwing hand (${Math.round(off)} px off)`);
 }
 
-test('c. throw with no second hand (realistic: 1700 px/s flick)', {
-  todo: 'not detected: the tracker sees ~1410 px/s for a 1700 px/s wrist peak, the threshold is 9 * palm = 1800 px/s',
-}, (t) => {
+test('c. throw with no second hand (realistic: 1700 px/s flick)', (t) => {
   assertBoomerang(t, throwScene({ sep: 0, peak: 1700, drops: 0 }, { alone: true }));
 });
 
@@ -156,43 +159,46 @@ test('g2. smooth flight: catch with dropped frames (hard throw)', (t) => {
   assertSmooth(t, throwScene({ ...HARD, drops: 2 }));
 });
 
-test('g3. smooth flight: boomerang while the throwing hand moves back after the flick', {
-  todo: 'the last leg ends on the live hand position, which steps at the 30 fps camera rate: the figure jumps up to '
-    + '~45 px in one substep (2-5x its speed) and accelerates past THROW.boost',
-}, (t) => {
+test('g3. smooth flight: boomerang while the throwing hand moves back after the flick', (t) => {
   assertSmooth(t, throwScene({ sep: 0, peak: 2600, drops: 0 }, { alone: true }));
 });
 
-/** The track that was the thrower before the flick still follows the thrower, and no track was replaced. */
-function assertIdentity(t, r, sep) {
+/**
+ * From the flick on, each track keeps following its own hand: on every camera frame the thrower track sits on
+ * the thrower and the other track on the other hand (where it was last detected while it is lost), and no track
+ * was replaced by a new one.
+ */
+function assertIdentity(t, r) {
   const before = r.frames.findLast((fr) => fr.t < T0);
-  const thrower = before.lead;
-  const other = before.tool;
-  assert.ok(thrower && other, 'both hands tracked before the flick');
-  let worst = 0;
-  let swapped = 0;
+  const own = [before.lead, before.tool]; // track of hand 0 (the thrower) and of hand 1
+  assert.ok(own[0] && own[1], 'both hands tracked before the flick');
+  const last = [null, null]; // last detected pose of each hand
+  const off = [0, 0];
+  const worst = [0, 0];
   let replaced = 0;
   for (const fr of r.frames) {
-    if (fr.t < T0 + 0.4 || !fr.poses[0]) continue;
+    fr.poses.forEach((p, i) => p && (last[i] = p));
+    if (fr.t < T0) continue;
     const tracks = [fr.lead, fr.tool];
-    if (!tracks.includes(thrower) || !tracks.includes(other)) replaced++;
-    const x = fr.lead === thrower ? fr.leadX : fr.tool === thrower ? fr.toolX : NaN;
-    const off = Math.abs(x - fr.poses[0].x);
-    if (!(off < 100)) swapped++;
-    if (off > worst) worst = off;
+    if (!tracks.includes(own[0]) || !tracks.includes(own[1])) replaced++;
+    for (const i of [0, 1]) {
+      const x = fr.lead === own[i] ? fr.leadX : fr.tool === own[i] ? fr.toolX : NaN;
+      const d = Math.abs(x - last[i].x);
+      if (!(d < 100)) off[i]++;
+      if (d > worst[i]) worst[i] = d;
+    }
   }
-  t.diagnostic(`frames with the thrower track away from the thrower: ${swapped}, with a replaced track: ${replaced}`);
+  t.diagnostic(`frames off: thrower track ${off[0]} (worst ${Math.round(worst[0])} px), `
+    + `other track ${off[1]} (worst ${Math.round(worst[1])} px); frames with a replaced track: ${replaced}`);
   assert.equal(replaced, 0, 'the thrower is re-acquired as the same track, not as a new hand');
-  assert.equal(swapped, 0, `the thrower track follows the thrower (worst ${Math.round(worst)} px off)`);
+  assert.equal(off[0], 0, `the thrower track follows the thrower (worst ${Math.round(worst[0])} px off)`);
+  assert.equal(off[1], 0, `the other track follows the other hand (worst ${Math.round(worst[1])} px off)`);
 }
 
-test('h. hand identity after a fast flick with 3 dropped frames (realistic, hands 520 px apart)', {
-  todo: 'while the thrower is lost, the lead track takes the other hand (it is "near": within '
-    + 'max(W/4, 3 * palm) = 600 px of the predicted position), so the thrower and the other hand trade tracks',
-}, (t) => {
-  assertIdentity(t, throwScene({ ...REAL, drops: 3 }), REAL.sep);
+test('h. hand identity after a fast flick with 3 dropped frames (realistic, hands 520 px apart)', (t) => {
+  assertIdentity(t, throwScene({ ...REAL, drops: 3 }));
 });
 
 test('h2. hand identity after a fast flick with 3 dropped frames (hands 1000 px apart)', (t) => {
-  assertIdentity(t, throwScene({ ...HARD, drops: 3 }), HARD.sep);
+  assertIdentity(t, throwScene({ ...HARD, drops: 3 }));
 });

@@ -1,6 +1,6 @@
 // Scripted hand motions for the scenario tests, plus measurements shared by them.
 import { flick, ease } from './synth.js';
-import { CFG, THROW } from '../src/sim.js';
+import { THROW } from '../src/sim.js';
 
 export const SIZE = 200; // palm size in screen px: a hand ~50 cm from a 1280x720 webcam on a 1440x900 screen
 export const Y = 640; // palm height: hands held in the lower part of the picture, the figure hovers above
@@ -36,7 +36,7 @@ export function twoHands({ sep, size = SIZE, y = Y, motions = [], alone = false,
 
 /**
  * What the throw detector in sim.js saw during [t0, t1]: the substep with the fastest lead wrist, the flick
- * threshold for that hand, the distance to the other hand vs the `close` gate, and the mode.
+ * threshold for that hand, the distance to the other hand (px and palm sizes), the mode and the cooldown.
  */
 export function flickReport(log, t0, t1) {
   let best = null;
@@ -48,7 +48,6 @@ export function flickReport(log, t0, t1) {
   const { lead, tool } = best;
   const threshold = Math.max(THROW.minSpeed, lead.size * THROW.speed);
   const dist = tool ? Math.hypot(lead.x - tool.x, lead.y - tool.y) : null;
-  const closeAt = tool ? (CFG.portalAt * (lead.size + tool.size)) / 2 : null;
   return {
     t: +best.t.toFixed(3),
     seenPvx: Math.round(lead.pvx),
@@ -56,8 +55,7 @@ export function flickReport(log, t0, t1) {
     threshold: Math.round(threshold),
     flick: Math.abs(lead.pvx) > threshold && Math.abs(lead.pvx) > Math.abs(lead.pvy) * THROW.ratio,
     dist: dist && Math.round(dist),
-    closeAt: closeAt && Math.round(closeAt),
-    close: tool ? dist < closeAt : false,
+    palms: dist && +(dist / ((lead.size + tool.size) / 2)).toFixed(2),
     mode: best.mode,
     cooldown: +best.cooldown.toFixed(2),
   };

@@ -25,7 +25,7 @@ Open the printed URL and allow camera access. `/?demo` drives the figure with a 
 ## Modes
 
 - **Middle finger only** (lead hand): the figure turns into a blocky wireframe fist with one raised finger.
-- **Both hands brought together**: a different set of solids, chosen by the number of raised fingers on the lead hand — 0 sphere, 1 tetrahedron, 2 octahedron, 3 icosahedron, 4 dodecahedron, 5 torus.
+- **Both hands brought together** (and held there for a moment, so a throw toward the other hand is not a join): a different set of solids, chosen by the number of raised fingers on the lead hand — 0 sphere, 1 tetrahedron, 2 octahedron, 3 icosahedron, 4 dodecahedron, 5 torus.
 - **Joined, then pulled slightly apart**: a flat square portal. Its corners are the thumb and index fingertips of each hand (two corners per hand). The other raised fingers (middle, ring, pinky, both hands summed, 0–6) add layers to the Doctor Strange style mandala: rings, rune ticks, hexagram, octagram, rotating outer arcs.
 - Bring the hands back together to return to the solids; drop a hand to return to the single-hand mode.
 
