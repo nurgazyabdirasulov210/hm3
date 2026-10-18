@@ -6,6 +6,7 @@ import { lineMaterial } from './figure.js';
 const MAX_SEGS = 1600;
 const TAU = Math.PI * 2;
 const COLOR = new THREE.Color(0xff9a2e);
+const GROW_W = 16; // rad/s, open / close spring
 
 /**
  * Flat square spanned between the hands (two corners per hand) with a Doctor Strange style
@@ -23,6 +24,7 @@ export function createPortal(scene) {
 
   const corners = [0, 1, 2, 3].map(() => ({ x: 0, y: 0 }));
   let have = false;
+  let lastLevel = 0;
   let grow = 0;
   let growV = 0;
   let n = 0;
@@ -97,11 +99,13 @@ export function createPortal(scene) {
 
   /** corners: four {x, y} screen points in loop order, or null. level: 0..6, set by the extra raised fingers. */
   function update(pts, level, dt, t, tint) {
+    // While closing, the mandala keeps the level it had instead of dropping its layers at once.
+    if (pts) lastLevel = level;
+    level = lastLevel;
     if (pts) {
       if (!have) {
+        // Reopening while it still closes keeps the current size, so it never pops.
         pts.forEach((q, i) => Object.assign(corners[i], q));
-        grow = 0;
-        growV = 0;
         have = true;
       }
       const k = 1 - Math.exp(-30 * dt);
@@ -112,8 +116,12 @@ export function createPortal(scene) {
     } else {
       have = false;
     }
-    growV += (260 * ((pts ? 1 : 0) - grow) - 16 * growV) * dt;
-    grow += growV * dt;
+    // Critically damped and substepped: opens without overshoot and never blinks back after closing.
+    const steps = Math.max(1, Math.ceil(dt * 240));
+    for (let i = 0; i < steps; i++) {
+      growV += (GROW_W * GROW_W * ((pts ? 1 : 0) - grow) - 2 * GROW_W * growV) * (dt / steps);
+      grow += growV * (dt / steps);
+    }
 
     mesh.visible = grow > 0.02;
     if (!mesh.visible) return;

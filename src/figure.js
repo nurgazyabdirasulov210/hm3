@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { clamp } from './filters.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
@@ -6,8 +7,9 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 const RING = 120; // perimeter samples; divisible by 1..5 so corners stay sharp
 const PILLARS = 5;
 const HALF_H = 0.7;
-const GHOSTS = 10;
-const GHOST_STEP = 0.4; // frames of history between neighbouring ghosts (sub-frame, so the trail is dense)
+const GHOSTS = 16;
+const TRAIL = 0.067; // s of history covered by the ghosts: time-based, so the trail looks the same at any frame rate
+const SPIN_TRAIL = 0.35; // fraction of that history the ghosts' rotation lags behind
 const MORPH_K = 240; // per-vertex spring: underdamped, so the outline wobbles into the new shape
 const MORPH_C = 15;
 
@@ -69,6 +71,7 @@ export function createFigure(scene) {
 
   const color = COLORS[0].clone();
   let sides = 0;
+  let shown = 0; // visibility of the last place()
 
   function setSides(n) {
     sides = n;
@@ -81,6 +84,13 @@ export function createFigure(scene) {
       perimeter(n, n === 0 ? j / PILLARS : (j % n) / n, tmp);
       tgt[(RING + j) * 2] = tmp[0];
       tgt[(RING + j) * 2 + 1] = tmp[1];
+    }
+    // While hidden (another mode is showing) take the new shape and colour at once: it fades back in as
+    // the right shape instead of morphing out of a stale one.
+    if (shown < 0.05) {
+      cur.set(tgt);
+      vel.fill(0);
+      color.copy(COLORS[n]);
     }
   }
   setSides(0);
@@ -117,29 +127,41 @@ export function createFigure(scene) {
   }
 
   /**
-   * poses[0] is the current pose, poses[1..] are previous frames.
+   * poses[0] is the current pose, poses[1..] are previous frames, each with its time t (s).
    * `motion` (0..1) controls how visible the trailing ghosts are.
    */
   function place(poses, visibility, motion) {
+    // Pose at time `at`: the recorded frames around it and the blend factor between them.
+    const sample = (at) => {
+      let j = 0;
+      while (j < poses.length - 2 && poses[j + 1].t > at) j++;
+      const a0 = poses[j];
+      const a1 = poses[Math.min(j + 1, poses.length - 1)];
+      const span = a0.t - a1.t;
+      return [a0, a1, span > 0 ? clamp((a0.t - at) / span, 0, 1) : 0];
+    };
     layers.forEach((mesh, i) => {
-      const f = Math.min(i * GHOST_STEP, poses.length - 1);
-      const a0 = poses[Math.floor(f)];
-      const a1 = poses[Math.ceil(f)];
-      const k = f - Math.floor(f);
+      // Ghost i shows the pose i * TRAIL / GHOSTS seconds ago. Its rotation lags much less than its position:
+      // a fast spin would otherwise fan the edges out into a hatched smear.
+      const age = (i * TRAIL) / GHOSTS;
+      const [a0, a1, k] = sample(poses[0].t - age);
       mesh.position.set(a0.x + (a1.x - a0.x) * k, a0.y + (a1.y - a0.y) * k, 0);
-      mesh.quaternion.slerpQuaternions(a0.q, a1.q, k);
       mesh.scale.setScalar(a0.r + (a1.r - a0.r) * k);
-      const a = i === 0 ? visibility : visibility * motion * 0.55 * (1 - i / (GHOSTS + 1));
+      const [q0, q1, kq] = sample(poses[0].t - age * SPIN_TRAIL);
+      mesh.quaternion.slerpQuaternions(q0.q, q1.q, kq);
+      // Quadratic falloff: the trail is dense near the figure and thins out, so the outline stays readable.
+      const a = i === 0 ? visibility : visibility * motion * 0.32 * (1 - i / (GHOSTS + 1)) ** 2;
       mesh.visible = a > 0.01;
       // Premultiplied output: the canvas is transparent over the video.
       mesh.material.color.copy(color).multiplyScalar(a);
       mesh.material.opacity = a;
     });
+    shown = visibility;
   }
 
   function resize(w, h) {
     for (const mesh of layers) mesh.material.resolution.set(w, h);
   }
 
-  return { setSides, update, place, resize, color, ghosts: GHOSTS };
+  return { setSides, update, place, resize, color, trail: TRAIL };
 }
