@@ -37,5 +37,15 @@ Flick the lead hand fast sideways and the figure flies off in that direction, sp
 
 ## Tuning
 
-- `CFG` in `src/main.js` — follow spring, hover height, scale range, spin, blur, the join / portal distances, and `THROW` (flick sensitivity, flight and catch springs).
-- Constants at the top of `src/hands.js` — gesture thresholds.
+- `CFG` in `src/sim.js` — follow spring, hover height, scale range, spin, blur, the join / portal distances, and `THROW` (flick sensitivity, flight and catch springs).
+- Constants at the top of `src/tracker.js` — gesture thresholds.
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs the gesture / physics logic in Node (`node:test`, no camera, no browser): `test/synth.js` generates MediaPipe-shaped
+hand landmarks, `src/tracker.js` turns them into hands, `src/sim.js` moves the figure. Scenarios cover throws, rotation,
+modes and tracking identity. Known-failing scenarios are marked `todo`.
