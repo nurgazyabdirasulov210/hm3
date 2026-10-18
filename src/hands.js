@@ -2,7 +2,7 @@ import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import { createTracker, toScreen } from './tracker.js';
 
 /**
- * Starts hand tracking on the video. Returns read(now) -> { lead, tool, hands } and swap().
+ * Starts hand tracking on the video. Returns read(now) -> { lead, tool, hands } and swap(id) (see tracker.js).
  * The gesture measurements and the lead / tool bookkeeping live in tracker.js; this file only feeds it frames.
  */
 export async function startTracking(video, view) {
@@ -19,10 +19,16 @@ export async function startTracking(video, view) {
 
   const tracker = createTracker(view, (lm) => toScreen(lm, view, video.videoWidth, video.videoHeight));
 
+  // The next frame is requested first, so one failing frame (detectForVideo can throw, e.g. on a lost GPU
+  // context or a video that is being resized) does not stop tracking for good.
   const onFrame = () => {
-    const now = performance.now();
-    if (video.videoWidth) tracker.process(landmarker.detectForVideo(video, now), now);
     video.requestVideoFrameCallback(onFrame);
+    const now = performance.now();
+    try {
+      if (video.videoWidth) tracker.process(landmarker.detectForVideo(video, now), now);
+    } catch (err) {
+      console.warn('hand tracking frame failed', err);
+    }
   };
   video.requestVideoFrameCallback(onFrame);
 

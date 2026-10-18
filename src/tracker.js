@@ -25,13 +25,29 @@ const PINCH_MAX = 0.9;
 const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
 const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
-// Wrist velocity (the throw detector's input) is a straight-line fit over the last WRIST_SAMPLES raw wrist
-// positions no older than THROW_WINDOW_MS: 4 samples = 100 ms at 30 fps.
-export const THROW_WINDOW_MS = 150;
-const WRIST_SAMPLES = 4;
+// Wrist velocity (the throw detector's input) is a straight-line fit over the newest raw wrist positions:
+// at least FIT_SAMPLES of them spanning at least FIT_SPAN_MS, none older than FIT_MAX_AGE_MS. That is defined in
+// time, not frames, so it behaves the same at any camera rate: 4 samples / 100 ms at 30 fps, 7 / 100 ms at 60 fps,
+// 4 / 200 ms at 15 fps. With fewer samples than that the reading is 0: a short window cannot tell a glitch from motion.
+const FIT_SPAN_MS = 90;
+const FIT_SAMPLES = 4;
+const FIT_MAX_AGE_MS = 300;
+const MAX_SAMPLES = 8;
 // A wrist sample this far (in palm sizes) off the line through the others is a landmark glitch and is left out.
-// Real motion stays inside it: even a 2600 px/s flick bends the path by ~0.25 palm sizes over the window.
-const GLITCH = 0.3;
+// A hard flick bends its path by up to ~0.25 palm sizes over 100 ms, so its first or last sample may be left out
+// too, which costs little: the line through the other samples still follows the flick.
+const GLITCH = 0.2;
+// A hand re-acquired after a gap of up to GAP_MAX_MS (motion blur drops frames at the peak of a flick) reads the
+// speed across the gap if on the next frame it still moves the same way at GAP_KEEP times that speed or more,
+// and, if it was moving faster than GAP_MIN_SPEED px/s before the gap, the gap continues that motion.
+const GAP_MAX_MS = 250;
+const GAP_FRAMES = 1.8; // a gap is a step this many typical frame intervals long (a frame or more dropped)
+const GAP_KEEP = 0.3;
+const GAP_MIN_SPEED = 300;
+// Smoothing time constant (ms) of the gesture rates (twist, flip, open/close, fingertip velocity): k = 1 - exp(-dt / tau),
+// so the result does not depend on the camera frame rate.
+const RATE_TAU_MS = 60;
+const TIP_TAU_MS = 50;
 
 // Least-squares line through samples { t (ms), x, y }: velocity (px/s) and position at time t.
 function fitLine(s) {
@@ -56,31 +72,87 @@ function fitLine(s) {
   return { vx: vx * 1000, vy: vy * 1000, at: (t) => ({ x: xm + vx * (t - tm), y: ym + vy * (t - tm) }) };
 }
 
-// Wrist velocity from raw (unfiltered) samples. Any smoothing filter in front of the slope lags behind a
-// 150 ms flick, which made the old estimate read ~0.84x the true peak; the slope of a line fitted over ~100 ms
-// has no bias for steady motion, reads ~0.93x the peak of a short flick (it averages the speed over the
-// window) and averages the landmark noise down to ~20 px/s. With 4+ samples, a sample that the line through
-// the others misses by more than GLITCH palm sizes is dropped, so a single bad frame cannot fake a throw
-// (a smaller glitch shifts the reading by at most ~9 px/s per px, < 600 px/s).
-function wristVelocity(s, size) {
-  if (s.length < 2) return { vx: 0, vy: 0 };
-  if (s.length >= 4) {
-    // The suspect is the sample whose removal leaves the straightest line through the rest.
-    let best = null;
-    s.forEach((p, i) => {
-      const rest = s.filter((_, j) => j !== i);
-      const fit = fitLine(rest);
-      let spread = 0;
-      for (const r of rest) {
-        const q = fit.at(r.t);
-        spread += Math.hypot(r.x - q.x, r.y - q.y);
-      }
-      if (!best || spread < best.spread) best = { fit, spread, p };
-    });
-    const q = best.fit.at(best.p.t);
-    if (Math.hypot(best.p.x - q.x, best.p.y - q.y) > GLITCH * size) return best.fit;
+// The line through the samples, leaving out the one sample (a landmark glitch) that the line through the others
+// misses by more than GLITCH palm sizes. The suspect is the sample whose removal leaves the straightest line.
+function robustFit(s, size) {
+  let best = null;
+  s.forEach((p, i) => {
+    const rest = s.filter((_, j) => j !== i);
+    const fit = fitLine(rest);
+    let spread = 0;
+    for (const r of rest) {
+      const q = fit.at(r.t);
+      spread += Math.hypot(r.x - q.x, r.y - q.y);
+    }
+    if (!best || spread < best.spread) best = { fit, spread, p };
+  });
+  const q = best.fit.at(best.p.t);
+  return Math.hypot(best.p.x - q.x, best.p.y - q.y) > GLITCH * size ? best.fit : fitLine(s);
+}
+
+const median = (a) => [...a].sort((p, q) => p - q)[a.length >> 1];
+
+// Wrist velocity (px/s) from raw (unfiltered) samples, newest last. Any smoothing filter in front of the slope
+// lags behind a 150 ms flick; the slope of a line fitted over ~100 ms has no bias for steady motion, reads ~0.93x
+// the peak of a short flick (it averages the speed over the window) and averages the landmark noise down.
+// A single bad frame cannot fake a throw: it is dropped (robustFit) or, if smaller than GLITCH, shifts the
+// reading by at most ~9 px/s per px at 30 fps (less at 15 or 60 fps): < 400 px/s for a 200 px palm.
+// `tr` keeps the state of the gap rule between frames (tr.gapEnd: the first sample after a gap).
+function wristVelocity(s, size, tr) {
+  const n = s.length;
+  const b = s[n - 1];
+  const a = s[n - 2];
+  // Gaps: the camera lost the hand for a few frames (motion blur at the peak of a flick, an occlusion) and has
+  // it again. One frame later it is clear what happened: a flick blurred out by the camera keeps going the way
+  // it jumped, and then the speed across the gap is the reading (a line through the samples before the gap and
+  // the new ones would call the new ones a glitch: the hand sped up meanwhile). A hand that is found a little
+  // elsewhere and stays there, or a glitch, is not a flick: the samples before the gap are forgotten and the
+  // speed is measured afresh.
+  if (tr.gapEnd) {
+    const end = tr.gapEnd;
+    tr.gapEnd = null;
+    const i = s.indexOf(end);
+    const start = s[i - 1];
+    if (end === a && start) {
+      const g = (end.t - start.t) / 1000;
+      const h = (b.t - end.t) / 1000;
+      const gx = (end.x - start.x) / g;
+      const gy = (end.y - start.y) / g;
+      const cx = (b.x - end.x) / h;
+      const cy = (b.y - end.y) / h;
+      const vg = Math.hypot(gx, gy);
+      const vc = Math.hypot(cx, cy);
+      const pre = tr.gapPre;
+      const pv = Math.hypot(pre.vx, pre.vy);
+      const keeps = vg && vc >= GAP_KEEP * vg && (gx * cx + gy * cy) / (vg * vc) > 0.7;
+      const sameWay = pv < GAP_MIN_SPEED || (gx * pre.vx + gy * pre.vy) / (vg * pv) > 0.7;
+      if (g * 1000 <= GAP_MAX_MS && keeps && sameWay) return { vx: gx, vy: gy };
+    }
+    if (i > 0) s.splice(0, i);
+  } else if (n >= 4) {
+    const intervals = [];
+    for (let k = Math.max(1, n - MAX_SAMPLES); k < n - 1; k++) intervals.push(s[k].t - s[k - 1].t);
+    if (b.t - a.t >= GAP_FRAMES * median(intervals)) {
+      tr.gapEnd = b;
+      tr.gapPre = { vx: tr.pvx, vy: tr.pvy };
+      return { vx: 0, vy: 0 };
+    }
   }
-  return fitLine(s);
+  // Newest samples first, until there are enough of them over a long enough time.
+  const m = s.length;
+  const now = s[m - 1].t;
+  let k = m - 1;
+  while (
+    k > 0 &&
+    m - k < MAX_SAMPLES &&
+    !(m - k >= FIT_SAMPLES && now - s[k].t >= FIT_SPAN_MS) &&
+    now - s[k - 1].t <= FIT_MAX_AGE_MS
+  ) {
+    k--;
+  }
+  const fit = s.slice(k);
+  if (fit.length < FIT_SAMPLES || now - fit[0].t < FIT_SPAN_MS) return { vx: 0, vy: 0 };
+  return robustFit(fit, size);
 }
 
 // Hand orientation from metric world landmarks, in mirrored scene space (x right, y up, z toward the viewer),
@@ -147,8 +219,12 @@ export function openness(w) {
   return Math.min(open, pinch);
 }
 
+let nextId = 1; // track ids are never reused, so the simulation can name a hand across role changes
+
 class Track {
   constructor(d, now) {
+    this.id = nextId++;
+    this.born = now;
     this.t = now;
     this.seen = now;
     this.fx = new OneEuro(1.5, 0.012);
@@ -160,10 +236,38 @@ class Track {
     this.hist = [];
     this.mask = d.mask;
     this.fingers = popcount(d.mask);
-    this.wrists = []; // recent raw wrist positions { t, x, y }
-    this.vx = this.vy = this.pvx = this.pvy = this.twist = this.flip = this.openRate = 0;
-    this.tipX = this.tipY = this.angle = this.flipAngle = null;
+    this.resetMotion();
     this.update(d, now);
+  }
+
+  // Forgets every motion baseline: the next frames start measuring speeds and rates afresh.
+  resetMotion() {
+    this.wrists = []; // recent raw wrist positions { t, x, y }
+    this.gapEnd = null; // see wristVelocity
+    this.vx = this.vy = this.pvx = this.pvy = this.twist = this.flip = this.openRate = 0;
+    this.tipX = this.tipY = this.angle = this.flipAngle = null; // null: no baseline for the rates yet
+  }
+
+  // The camera -> screen mapping changed (window resize, new video size): x' = ox + sx * x, y' = oy + sy * y.
+  // Positions move with it, so the hand stays the same hand and the filters do not see a jump; speeds restart.
+  remap(ox, sx, oy, sy) {
+    const s = (Math.abs(sx) + Math.abs(sy)) / 2;
+    const move = (f, o, k) => {
+      if (f.x !== null) f.x = o + k * f.x;
+      f.dx *= k;
+    };
+    move(this.fx, ox, sx);
+    move(this.fy, oy, sy);
+    move(this.ftx, ox, sx);
+    move(this.fty, oy, sy);
+    move(this.fs, 0, s);
+    this.x = ox + sx * this.x;
+    this.y = oy + sy * this.y;
+    this.rawX = ox + sx * this.rawX;
+    this.rawY = oy + sy * this.rawY;
+    this.size *= s;
+    this.pts = this.pts.map((p) => ({ ...p, x: ox + sx * p.x, y: oy + sy * p.y }));
+    this.resetMotion();
   }
 
   update(d, now) {
@@ -182,8 +286,10 @@ class Track {
     // Wrist velocity (px/s), used to detect a throw (see wristVelocity). The wrist is the pivot of a twist
     // or a flip, so turning the hand does not read as moving it.
     this.wrists.push({ t: now, x: d.pts[0].x, y: d.pts[0].y });
-    while (this.wrists.length > WRIST_SAMPLES || now - this.wrists[0].t > THROW_WINDOW_MS) this.wrists.shift();
-    const v = wristVelocity(this.wrists, this.size);
+    while (this.wrists.length > MAX_SAMPLES + 2 || now - this.wrists[0].t > FIT_MAX_AGE_MS + GAP_MAX_MS) {
+      this.wrists.shift();
+    }
+    const v = wristVelocity(this.wrists, this.size, this);
     this.pvx = v.vx;
     this.pvy = v.vy;
 
@@ -195,18 +301,21 @@ class Track {
       this.fingers = popcount(d.mask);
     }
 
+    // Rates are smoothed with a time constant, not a per-frame factor, so a faster camera does not let
+    // more landmark noise through.
+    const kRate = 1 - Math.exp((-dt * 1000) / RATE_TAU_MS);
+    const kTip = 1 - Math.exp((-dt * 1000) / TIP_TAU_MS);
     const open = this.fo.filter(d.open, dt);
-    if (this.open !== undefined) this.openRate += 0.5 * ((open - this.open) / dt - this.openRate);
-    this.open = open;
-
     const tx = this.ftx.filter(d.pts[8].x, dt);
     const ty = this.fty.filter(d.pts[8].y, dt);
     if (this.tipX !== null) {
-      this.vx += 0.6 * ((tx - this.tipX) / dt - this.vx);
-      this.vy += 0.6 * ((ty - this.tipY) / dt - this.vy);
-      this.twist += 0.5 * (wrapAngle(d.angle - this.angle) / dt - this.twist);
-      this.flip += 0.5 * (wrapAngle(d.flip - this.flipAngle) / dt - this.flip);
+      this.openRate += kRate * ((open - this.open) / dt - this.openRate);
+      this.vx += kTip * ((tx - this.tipX) / dt - this.vx);
+      this.vy += kTip * ((ty - this.tipY) / dt - this.vy);
+      this.twist += kRate * (wrapAngle(d.angle - this.angle) / dt - this.twist);
+      this.flip += kRate * (wrapAngle(d.flip - this.flipAngle) / dt - this.flip);
     }
+    this.open = open;
     this.tipX = tx;
     this.tipY = ty;
     this.angle = d.angle;
@@ -226,6 +335,7 @@ export function toScreen(lm, view, vw, vh) {
  * Hand tracker. `toPx(lm)` maps a normalised landmark to screen pixels (see toScreen).
  * process(result, now) takes a MediaPipe HandLandmarker result { landmarks, worldLandmarks } at time `now` (ms).
  * read(now) -> { lead, tool, hands }. The first hand to enter the frame becomes the lead, the second one the tool.
+ * Each snapshot carries the track's `id`, unique for as long as the page runs, and its `age` (ms).
  */
 export function createTracker(view, toPx) {
   let lead = null;
@@ -281,8 +391,31 @@ export function createTracker(view, toPx) {
   // that missed the previous frame (its prediction is a guess), so a hand that is being tracked keeps it.
   const cost = (tr, d) => gap(tr, d) + (tr.seen < lastFrame ? tr.size : 0);
 
+  // Where the lead was when it expired with no other hand to take over: when hands come back after that,
+  // the one nearest to it leads again (MediaPipe's order is random), so the figure does not jump across.
+  let lastLead = null;
+
+  // The camera -> screen mapping as two probe points. A window resize or a new video size changes it, which
+  // moves every hand on screen in one frame: without this that jump reads as a flick and throws the figure.
+  let mapping = null;
+  function checkMapping() {
+    const a = toPx({ x: 0, y: 0, z: 0 });
+    const b = toPx({ x: 1, y: 1, z: 0 });
+    const m = { a, b, W: view.W, H: view.H };
+    const old = mapping;
+    mapping = m;
+    if (!old || (old.a.x === a.x && old.a.y === a.y && old.b.x === b.x && old.b.y === b.y)) return;
+    const sx = (b.x - a.x) / (old.b.x - old.a.x || 1);
+    const sy = (b.y - a.y) / (old.b.y - old.a.y || 1);
+    const ox = a.x - sx * old.a.x;
+    const oy = a.y - sy * old.a.y;
+    for (const tr of [lead, tool]) tr?.remap(ox, sx, oy, sy);
+    if (lastLead) lastLead = { x: ox + sx * lastLead.x, y: oy + sy * lastLead.y };
+  }
+
   function process(result, now) {
     expire(now);
+    checkMapping();
     frameNow = now;
     const dets = result.landmarks.map((lm, i) => measure(lm, result.worldLandmarks[i]));
 
@@ -315,6 +448,10 @@ export function createTracker(view, toPx) {
       }
     }
     // A detection no track claims is a hand entering the frame.
+    if (!lead && lastLead && dets.length === 2) {
+      const off = (d) => Math.hypot(d.x - lastLead.x, d.y - lastLead.y);
+      if (off(dets[1]) < off(dets[0])) dets.reverse();
+    }
     for (const d of dets) {
       if (!lead) lead = new Track(d, now);
       else if (!tool) tool = new Track(d, now);
@@ -325,12 +462,15 @@ export function createTracker(view, toPx) {
   function expire(now) {
     if (tool && now - tool.seen > TOOL_GRACE_MS) tool = null;
     if (lead && now - lead.seen > LEAD_GRACE_MS) {
+      if (!tool) lastLead = { x: lead.rawX, y: lead.rawY };
       lead = tool; // the remaining hand takes over the figure
       tool = null;
     }
   }
 
   const snap = (tr, now) => ({
+    id: tr.id,
+    age: now - tr.born, // ms since the hand was first tracked
     x: tr.x,
     y: tr.y,
     size: tr.size,
@@ -361,9 +501,10 @@ export function createTracker(view, toPx) {
         hands: [lead, tool].filter(Boolean).map((tr) => tr.pts),
       };
     },
-    // The hands trade roles: the figure now follows the former tool.
-    swap() {
-      [lead, tool] = [tool, lead];
+    // The track with this id becomes the lead (the figure follows it), the other one the tool. Idempotent:
+    // nothing happens if it already leads or is gone. Without an id the hands simply trade roles.
+    swap(id) {
+      if (id === undefined || tool?.id === id) [lead, tool] = [tool, lead];
     },
     // The live Track objects, for tests that check hand identity.
     tracks: () => ({ lead, tool }),

@@ -46,6 +46,7 @@ export const THROW = {
   spin: 11, // rad/s while flying
   track: 10, // rad/s, critically damped follower of a leg's end point: the hand only moves at camera rate
   cooldown: 0.5, // s after a landing before the next throw
+  minAge: 0.2, // s a hand must have been tracked before it can throw (a hand swept into view is not a flick)
 };
 
 export const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
@@ -56,8 +57,10 @@ const isMiddle = (m) => (m & 4) !== 0 && (m & 0b11010) === 0;
  * Creates the simulation. `view` is { W, H } in CSS pixels (read live, so a resize applies at once);
  * `figure` needs setSides(n) and update(dt) (the prism figure, or a stub in tests).
  * step(input, dt, t) advances one substep; input is { lead, tool } hand snapshots from the tracker
- * (either may be null). After a catch it swaps input.lead / input.tool and calls sim.swapHands(),
- * which main.js wires to the tracker so the hands trade roles there too.
+ * (either may be null; `id` names a hand across role changes, `age` is ms since it was first tracked).
+ * After a catch it calls sim.swapHands(catcherId), which main.js wires to the tracker: the hand with that id
+ * leads from then on (a no-op if the tracker already made it the lead); input.lead / input.tool are swapped
+ * to match. Hands without ids (the demo) fall back to "the tool catches" and a plain swap.
  */
 export function createSim({ view, figure }) {
   const pos = { x: view.W / 2, y: view.H / 2 };
@@ -75,7 +78,7 @@ export function createSim({ view, figure }) {
   let mode = 'single'; // 'single' | 'joined' | 'portal'
   let vPrism = 0;
   let solidKey = null;
-  let flight = null; // { dir, speed, phase: 'out' | 'home' | 'back', out, boost, leg, end }
+  let flight = null; // { dir, speed, phase: 'out' | 'home' | 'back', catcher, out, boost, leg, end }
   let cooldown = 0;
   let joinWait = 0; // how long the hands have been held close and steady
   let middle = false;
@@ -84,6 +87,7 @@ export function createSim({ view, figure }) {
   let scaleEase = 1;
   const bank = { x: 0, z: 0 };
   let portalPts = null;
+  let portalCross = null; // corner order of the portal (see portalCorners), kept while it stays a portal
   let portalLevel = 0;
   let spinY = 0;
   const omega = new THREE.Vector3();
@@ -113,11 +117,26 @@ export function createSim({ view, figure }) {
     return d < CFG.leaveAt ? 'joined' : 'portal';
   }
 
-  // Four corners in loop order: two fingertips (thumb, index) of each hand.
+  // Four corners in loop order: two fingertips (thumb, index) of each hand. Of the two ways to join the
+  // hands' edges into a loop, the one with the shorter connecting edges never crosses itself (a crossed
+  // pair of edges is always longer than the uncrossed one). Hysteresis keeps the order steady near a tie.
   function portalCorners(lead, tool) {
     const [lt, li, tt, ti] = [lead.pts[4], lead.pts[8], tool.pts[4], tool.pts[8]];
-    const parallel = (li.x - lt.x) * (ti.x - tt.x) + (li.y - lt.y) * (ti.y - tt.y) >= 0;
-    return parallel ? [lt, li, ti, tt] : [lt, li, tt, ti];
+    const d = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+    const straight = d(li, ti) + d(tt, lt);
+    const crossed = d(li, tt) + d(ti, lt);
+    const margin = 0.1 * (d(lt, li) + d(tt, ti)) / 2;
+    if (portalCross === null) portalCross = crossed < straight;
+    else if (portalCross ? straight < crossed - margin : crossed < straight - margin) portalCross = !portalCross;
+    return portalCross ? [lt, li, tt, ti] : [lt, li, ti, tt];
+  }
+
+  // The hand a flight is heading for: the one with the catcher's id, whatever its role is now (the tracker
+  // may have promoted it to lead meanwhile), or null once it is gone. Hands without ids: the tool.
+  function catcherOf(lead, tool) {
+    const c = flight.catcher;
+    if (c === undefined) return tool;
+    return tool?.id === c ? tool : lead?.id === c ? lead : null;
   }
 
   // Starts a flight leg toward goal { x, y } from the current position and velocity, so velocity never
@@ -167,10 +186,13 @@ export function createSim({ view, figure }) {
     const dir = Math.sign(lead.pvx);
     const speed = clamp(Math.abs(lead.pvx), THROW.launchMin, THROW.launchMax);
     const m = radius * scale * 1.2;
+    const home = !!tool && (tool.x - pos.x) * dir > 0;
     flight = {
       dir,
       speed,
-      phase: tool && (tool.x - pos.x) * dir > 0 ? 'home' : 'out',
+      phase: home ? 'home' : 'out',
+      catcher: home ? tool.id : undefined,
+      thrower: lead.id,
       out: { x: clamp(pos.x + dir * view.W * THROW.reach, m, view.W - m), y: pos.y },
       // Launch: speed up to the throw velocity with a bounded acceleration, then follow the curve.
       boost: { x: dir * speed, y: -speed * THROW.lift },
@@ -181,20 +203,27 @@ export function createSim({ view, figure }) {
   }
 
   // One flight step. Returns 'caught' when the other hand has taken the figure.
-  function fly(tool, rest, dt) {
+  function fly(lead, tool, rest, dt) {
     const f = flight;
     // A hand showing up on the far side catches the figure; a catcher that disappears sends it back.
     if (f.phase === 'out' && tool && (tool.x - pos.x) * f.dir > 0) {
       f.phase = 'home';
+      f.catcher = tool.id;
       if (f.leg) startLeg(restOver(tool));
-    } else if (f.phase === 'home' && !tool) {
+    } else if (f.phase === 'home' && !catcherOf(lead, tool)) {
       f.phase = 'back';
       if (f.leg) startLeg(rest);
     }
     omega.y += (f.dir * THROW.spin - omega.y) * (1 - Math.exp(-5 * dt));
-    const goal = f.phase === 'home' ? restOver(tool) : f.phase === 'out' ? f.out : rest;
+    const goal = f.phase === 'home' ? restOver(catcherOf(lead, tool)) : f.phase === 'out' ? f.out : rest;
 
     if (f.boost) {
+      // The flick is still speeding up while the figure launches: the fastest reading sets the throw speed.
+      if (lead?.fresh && (f.thrower === undefined || lead.id === f.thrower) && Math.sign(lead.pvx) === f.dir) {
+        f.speed = Math.max(f.speed, clamp(Math.abs(lead.pvx), THROW.launchMin, THROW.launchMax));
+        f.boost.x = f.dir * f.speed;
+        f.boost.y = -f.speed * THROW.lift;
+      }
       const dvx = f.boost.x - vel.x;
       const dvy = f.boost.y - vel.y;
       const dv = Math.hypot(dvx, dvy);
@@ -251,6 +280,7 @@ export function createSim({ view, figure }) {
       }
     }
     const joined = mode === 'joined';
+    if (mode !== 'portal') portalCross = null;
     portalPts = mode === 'portal' ? portalCorners(lead, tool) : null;
     portalLevel = mode === 'portal' ? popcount(lead.mask & 0b11100) + popcount(tool.mask & 0b11100) : 0;
     vPrism += ((mode === 'single' && !middle ? 1 : 0) - vPrism) * (1 - Math.exp(-10 * dt));
@@ -279,11 +309,15 @@ export function createSim({ view, figure }) {
       visibility += (1 - visibility) * (1 - Math.exp(-8 * dt));
 
       if (flight) {
-        if (fly(tool, rest, dt) === 'caught' && tool) {
-          // The receiving hand leads now, the thrower becomes the tool.
-          sim.swapHands();
-          [lead, tool] = [tool, lead];
-          [input.lead, input.tool] = [lead, tool];
+        const catcher = flight.catcher;
+        if (fly(lead, tool, rest, dt) === 'caught') {
+          // The receiving hand leads now, the thrower becomes the tool. The tracker may already have made
+          // the catcher the lead (the thrower was lost for its grace period), then roles stay as they are.
+          sim.swapHands(catcher);
+          if (catcher === undefined || lead?.id !== catcher) {
+            [lead, tool] = [tool, lead];
+            [input.lead, input.tool] = [lead, tool];
+          }
           // Keep the shape and the size: they only change once the new hands actually ask for it.
           if (lead) shapeLock = { key: shapeKey, mask: lead.mask };
           scaleHeld = scale;
@@ -298,6 +332,7 @@ export function createSim({ view, figure }) {
         pos.y += vel.y * dt;
         const flick =
           lead.fresh &&
+          !(lead.age < THROW.minAge * 1000) &&
           Math.abs(lead.pvx) > Math.max(THROW.minSpeed, lead.size * THROW.speed) &&
           Math.abs(lead.pvx) > Math.abs(lead.pvy) * THROW.ratio;
         // A flick toward a nearby other hand is a throw too: joining needs the hands held close (see nextMode).
@@ -336,7 +371,8 @@ export function createSim({ view, figure }) {
 
     if (!flight && mode !== 'portal') {
       handSpin(lead, dt);
-      handSpin(tool, dt);
+      // Not right after a landing: the thrower's follow-through twist must not spin the figure.
+      if (!cooldown) handSpin(tool, dt);
     }
     if (mode === 'single' && tool?.fresh && !flight) {
       const goal = CFG.scaleMin + (CFG.scaleMax - CFG.scaleMin) * tool.open;

@@ -3,7 +3,8 @@
 // (the loop in main.js).
 import { createTracker } from '../src/tracker.js';
 import { createSim } from '../src/sim.js';
-import { VIEW, toPx, makeRng, detect } from './synth.js';
+import { VIEW, CAM, makeRng, detect } from './synth.js';
+import { toScreen } from '../src/tracker.js';
 
 /**
  * scene: {
@@ -11,17 +12,19 @@ import { VIEW, toPx, makeRng, detect } from './synth.js';
  *   hands(t): [pose | null, pose | null] — the hands in front of the camera at time t (see synth.hand),
  *     index 0 / 1 are fixed physical hands (not tracker roles),
  *   drop(t, i): true when hand i is not detected in the camera frame captured at t (motion blur, occlusion),
- *   seed, fps (render, 60), camFps (30), noise ({ imageNoise, worldNoise }).
+ *   seed, fps (render, 60), camFps (30), noise ({ imageNoise, worldNoise }),
+ *   resize(t): optional { W, H } of the window at time t (a resize moves the hands on screen, not in the camera).
  * }
  * Returns { log, frames, sim, tracker, sides }: log has one entry per substep, frames one per camera frame.
  */
 export function run(scene) {
-  const { duration, hands, drop = () => false, seed = 1, fps = 60, camFps = 30, noise } = scene;
+  const { duration, hands, drop = () => false, seed = 1, fps = 60, camFps = 30, noise, resize } = scene;
   const rng = makeRng(seed);
-  const tracker = createTracker(VIEW, toPx);
+  const view = { ...VIEW }; // live, like the page's: main.js updates it on resize
+  const tracker = createTracker(view, (lm) => toScreen(lm, view, CAM.W, CAM.H));
   const sides = [];
   const figure = { setSides: (n) => sides.push(n), update: () => {} };
-  const sim = createSim({ view: VIEW, figure });
+  const sim = createSim({ view, figure });
   sim.swapHands = tracker.swap;
 
   const log = [];
@@ -31,6 +34,7 @@ export function run(scene) {
   let simTime = 0;
   for (let k = 1; k * (1000 / fps) <= duration * 1000; k++) {
     const now = k * (1000 / fps);
+    if (resize) Object.assign(view, resize(now / 1000));
     // Camera frames captured up to now, processed in order (MediaPipe runs on each one).
     while (camK * (1000 / camFps) <= now) {
       const tc = (camK * (1000 / camFps)) / 1000;
