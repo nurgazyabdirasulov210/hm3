@@ -2,7 +2,7 @@
 // Pure state machine, no DOM and no renderer: main.js feeds it hand snapshots and draws the result,
 // tests feed it synthetic hands. Uses THREE only for vector / quaternion math.
 import * as THREE from 'three';
-import { SOLID_KEYS, MIDDLE } from './shapes.js';
+import { SOLID_KEYS, MIDDLE, SPECIAL_KEYS } from './shapes.js';
 import { clamp, smoothstep } from './filters.js';
 
 export const CFG = {
@@ -49,9 +49,32 @@ export const THROW = {
   minAge: 0.2, // s a hand must have been tracked before it can throw (a hand swept into view is not a flick)
 };
 
+// The "sorcerer" gesture (thumb + index + pinky up, middle + ring folded) raises a Doctor Strange shield on the
+// lead hand. The thumb is required: index + pinky alone is the "rock" gesture (a crystal).
+export const SHIELD = {
+  mask: 0b10011,
+  size: 1.6, // radius in palm sizes
+  lift: 0.3, // centre this many palm sizes from the palm centre toward the fingers
+  fadeIn: 10, // 1/s
+  fadeOut: 6, // 1/s
+  turn: 14, // 1/s, smoothing of the roll angle
+};
+
+// Portal: the lead hand's middle / ring / pinky pattern picks the mandala design; it must hold this long to switch.
+export const SPELL_HOLD = 0.15; // s
+
 export const popcount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
 // Only the middle finger up (the thumb is too unreliable to count).
 const isMiddle = (m) => (m & 4) !== 0 && (m & 0b11010) === 0;
+const wrapAngle = (a) => a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;
+// In-plane angle of a hand on screen (y down): 0 when the fingers point straight up, positive turned clockwise.
+// From the wrist -> middle knuckle line of the landmarks; null when they are missing (bare test snapshots).
+function handRoll(h) {
+  const w = h.pts?.[0];
+  const k = h.pts?.[9];
+  if (!w || !k || (w.x === k.x && w.y === k.y)) return null;
+  return Math.atan2(k.y - w.y, k.x - w.x) + Math.PI / 2;
+}
 
 /**
  * Creates the simulation. `view` is { W, H } in CSS pixels (read live, so a resize applies at once);
@@ -89,6 +112,12 @@ export function createSim({ view, figure }) {
   let portalPts = null;
   let portalCross = null; // corner order of the portal (see portalCorners), kept while it stays a portal
   let portalLevel = 0;
+  let portalSpell = 0;
+  let spellWant = -1; // a new design waiting to be held for SPELL_HOLD
+  let spellWait = 0;
+  let shield = null; // { x, y, r, angle, vis }
+  let shieldOn = false;
+  let special = false; // a single-hand special gesture solid is showing
   let spinY = 0;
   const omega = new THREE.Vector3();
   const qUser = new THREE.Quaternion();
@@ -266,7 +295,46 @@ export function createSim({ view, figure }) {
     omega.addScaledVector(handAxis, (h.flip * CFG.spinGain - omega.dot(handAxis)) * kFlip);
   }
 
+  // Portal design from the lead hand's middle / ring / pinky (bits 2..4 of the mask -> 0..7). Entering the portal
+  // takes the current pattern at once; a change must then hold for SPELL_HOLD, so a design never flickers.
+  function updateSpell(mask, dt) {
+    const want = (mask >> 2) & 7;
+    if (mode !== prevMode) {
+      portalSpell = want;
+      spellWant = -1;
+    } else if (want === portalSpell) {
+      spellWant = -1;
+    } else if (want !== spellWant) {
+      spellWant = want;
+      spellWait = dt;
+    } else if ((spellWait += dt) >= SPELL_HOLD - 1e-9) {
+      portalSpell = want;
+      spellWant = -1;
+    }
+  }
+
+  // Shield over the lead palm while it shows the sorcerer gesture. It stays (fading out) after the gesture ends,
+  // following the hand while it is still there, and is null once fully gone.
+  function updateShield(lead, dt) {
+    if (shieldOn || shield) {
+      const roll = lead ? handRoll(lead) : null;
+      if (!shield) shield = { x: lead.x, y: lead.y, r: lead.size * SHIELD.size, angle: roll ?? 0, vis: 0 };
+      if (lead) {
+        if (roll !== null) shield.angle += wrapAngle(roll - shield.angle) * (1 - Math.exp(-SHIELD.turn * dt));
+        // Up the hand (toward the fingers), along the smoothed roll.
+        shield.x = lead.x + Math.sin(shield.angle) * lead.size * SHIELD.lift;
+        shield.y = lead.y - Math.cos(shield.angle) * lead.size * SHIELD.lift;
+        shield.r += (lead.size * SHIELD.size - shield.r) * (1 - Math.exp(-10 * dt));
+      }
+      const k = shieldOn ? SHIELD.fadeIn : SHIELD.fadeOut;
+      shield.vis += ((shieldOn ? 1 : 0) - shield.vis) * (1 - Math.exp(-k * dt));
+      if (!shieldOn && shield.vis < 0.01) shield = null;
+    }
+  }
+
+  let prevMode = mode;
   function step(input, dt, t) {
+    prevMode = mode;
     let { lead, tool } = input;
     cooldown = Math.max(0, cooldown - dt);
     // While the figure is in the air nothing else changes: no mode switches, no morphs.
@@ -274,16 +342,33 @@ export function createSim({ view, figure }) {
       mode = nextMode(lead, tool, dt);
       // After a catch the figure keeps its shape until the catching hand changes its gesture.
       if (shapeLock && (!lead || lead.mask !== shapeLock.mask || mode !== 'single')) shapeLock = null;
-      if (!shapeLock) {
+      shieldOn = mode === 'single' && !!lead && lead.mask === SHIELD.mask;
+      // While the shield is up the figure is hidden and keeps whatever shape it had.
+      if (!shapeLock && !shieldOn) {
         middle = mode === 'single' && !!lead && isMiddle(lead.mask);
-        if (lead) solidKey = mode === 'joined' ? SOLID_KEYS[Math.min(lead.fingers, 5)] : middle ? MIDDLE : null;
+        special = mode === 'single' && !!lead && !middle && lead.mask in SPECIAL_KEYS;
+        if (lead) {
+          solidKey =
+            mode === 'joined'
+              ? SOLID_KEYS[Math.min(lead.fingers + (tool?.fingers ?? 0), SOLID_KEYS.length - 1)]
+              : middle
+                ? MIDDLE
+                : special
+                  ? SPECIAL_KEYS[lead.mask]
+                  : null;
+        }
       }
+    } else {
+      shieldOn = false;
     }
+    updateShield(lead, dt);
     const joined = mode === 'joined';
     if (mode !== 'portal') portalCross = null;
     portalPts = mode === 'portal' ? portalCorners(lead, tool) : null;
-    portalLevel = mode === 'portal' ? popcount(lead.mask & 0b11100) + popcount(tool.mask & 0b11100) : 0;
-    vPrism += ((mode === 'single' && !middle ? 1 : 0) - vPrism) * (1 - Math.exp(-10 * dt));
+    portalLevel = mode === 'portal' ? popcount(tool.mask & 0b11100) : 0;
+    if (mode === 'portal') updateSpell(lead.mask, dt);
+    else spellWant = -1;
+    vPrism += ((mode === 'single' && !middle && !special ? 1 : 0) - vPrism) * (1 - Math.exp(-10 * dt));
 
     // Joined hands act as one: the figure hangs above the point between them.
     if (lead) {
@@ -306,7 +391,8 @@ export function createSim({ view, figure }) {
         vel.x = vel.y = 0;
         pop = 0.3;
       }
-      visibility += (1 - visibility) * (1 - Math.exp(-8 * dt));
+      // The shield hides the figure; it pops back in once the shield goes down.
+      visibility += ((shieldOn ? 0 : 1) - visibility) * (1 - Math.exp(-8 * dt));
 
       if (flight) {
         const catcher = flight.catcher;
@@ -336,25 +422,27 @@ export function createSim({ view, figure }) {
           Math.abs(lead.pvx) > Math.max(THROW.minSpeed, lead.size * THROW.speed) &&
           Math.abs(lead.pvx) > Math.abs(lead.pvy) * THROW.ratio;
         // A flick toward a nearby other hand is a throw too: joining needs the hands held close (see nextMode).
-        if (mode === 'single' && !cooldown && visibility > 0.5 && flick) {
+        if (mode === 'single' && !cooldown && visibility > 0.5 && !shield && flick) {
           launch(lead, tool);
         }
       }
 
-      if (lead && !flight) {
+      if (lead && !flight && !shieldOn) {
         const key = shapeLock
           ? shapeLock.key
           : mode === 'portal'
             ? 'portal'
             : joined
-              ? `j${lead.fingers}`
+              ? `j${lead.fingers + (tool?.fingers ?? 0)}`
               : middle
                 ? 'm'
-                : `s${lead.fingers}`;
+                : special
+                  ? solidKey
+                  : `s${lead.fingers}`;
         if (key !== shapeKey) {
           const first = shapeKey === '';
           shapeKey = key;
-          if (mode === 'single' && !middle && !shapeLock) figure.setSides(lead.fingers);
+          if (mode === 'single' && !middle && !special && !shapeLock) figure.setSides(lead.fingers);
           if (!first && mode !== 'portal') {
             pulse = 1;
             popV += 5;
@@ -431,6 +519,9 @@ export function createSim({ view, figure }) {
     get lastAnchor() { return lastAnchor; },
     get portalPts() { return portalPts; },
     get portalLevel() { return portalLevel; },
+    get portalSpell() { return portalSpell; },
+    get shield() { return shield; },
+    get special() { return special; },
     get spinY() { return spinY; },
     get omega() { return omega; },
     get bank() { return bank; },
