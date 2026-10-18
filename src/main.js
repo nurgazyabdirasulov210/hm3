@@ -1,12 +1,18 @@
 import * as THREE from 'three';
 import { createFigure } from './figure.js';
-import { createSolids, MIDDLE } from './shapes.js';
+import * as shapes from './shapes.js';
 import { createPortal } from './portal.js';
+import { createShield } from './shield.js';
+import { createSparks } from './sparks.js';
+import { PORTAL_DESIGNS } from './spells.js';
 import { startTracking } from './hands.js';
 import { createSim, CFG, popcount } from './sim.js';
 import { clamp } from './filters.js';
 
+const { createSolids, MIDDLE } = shapes;
 const GLOW = { single: null, joined: new THREE.Color(0xb28dff), middle: new THREE.Color(0xff5a5a), portal: new THREE.Color(0xff9a2e) };
+// Each solid's own glow colour, when shapes.js gives one.
+const SOLID_GLOW = Object.fromEntries(Object.entries(shapes.SOLID_COLORS ?? {}).map(([k, c]) => [k, new THREE.Color(c)]));
 
 const video = document.getElementById('cam');
 const sceneCanvas = document.getElementById('scene');
@@ -22,7 +28,9 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 1, 10000);
 const figure = createFigure(scene);
 const solids = createSolids(scene);
-const portal = createPortal(scene);
+const sparks = createSparks(scene);
+const portal = createPortal(scene, sparks);
+const shield = createShield(scene, sparks);
 
 function resize() {
   view.W = innerWidth;
@@ -40,6 +48,8 @@ function resize() {
   figure.resize(view.W, view.H);
   solids.resize(view.W, view.H);
   portal.resize(view.W, view.H);
+  shield.resize(view.W, view.H);
+  sparks.resize(view.W, view.H);
 }
 addEventListener('resize', resize);
 resize();
@@ -71,16 +81,24 @@ function present(dt, t) {
   poses.unshift(pose);
   figure.place(poses, S.visibility * S.vPrism, clamp(speed / 700 + spin / 8 + S.pulse, 0, 1));
 
-  const target = GLOW[mode === 'portal' ? 'portal' : mode === 'joined' ? 'joined' : S.solidKey === MIDDLE ? 'middle' : 'single'] ?? figure.color;
+  const sh = S.shield ?? null;
+  // Sorcery (portal, shield) glows Strange orange; a solid glows in its own colour.
+  const target =
+    // (also while a spell still dissolves: last frame's segment counts)
+    mode === 'portal' || sh?.vis > 0.3 || portal.stats.segs + shield.stats.segs > 150
+      ? GLOW.portal
+      : (SOLID_GLOW[S.solidKey] ?? GLOW[mode === 'joined' ? 'joined' : S.solidKey === MIDDLE ? 'middle' : 'single'] ?? figure.color);
   glow.lerp(target, 1 - Math.exp(-8 * dt));
   // A solid keeps its own tint while it fades out, instead of taking on the next mode's colour (brown, grey).
   if (S.solidKey) solidTint.lerp(target, 1 - Math.exp(-8 * dt));
   solids.place(S.solidKey, pose, S.visibility, solidTint, dt);
-  portal.update(S.portalPts, S.portalLevel, dt, t, GLOW.portal);
+  portal.update(S.portalPts, S.portalSpell ?? 0, clamp(S.portalLevel, 0, 3), dt, t);
+  shield.update(sh, dt, t);
+  sparks.update(dt, t);
 
   // Motion blur stays light: the figure must remain readable while it flies and spins.
   const blurTarget =
-    clamp(speed / 1500 + spin * 0.06 + Math.abs(S.scaleV) * 0.4 + S.pulse * 0.8, 0, CFG.maxBlur) * (mode === 'portal' ? 0.15 : 1);
+    clamp(speed / 1500 + spin * 0.06 + Math.abs(S.scaleV) * 0.4 + S.pulse * 0.8, 0, CFG.maxBlur) * (mode === 'portal' || sh ? 0.15 : 1);
   blur += (blurTarget - blur) * (1 - Math.exp(-18 * dt));
   const glowCss = `drop-shadow(0 0 12px #${glow.getHexString()})`;
   sceneCanvas.style.filter = blur > 0.25 ? `blur(${blur.toFixed(2)}px) ${glowCss}` : glowCss;
@@ -114,11 +132,11 @@ function drawHands(hands) {
 // --- input ------------------------------------------------------------------
 // `?demo` drives the figure with a synthetic hand, to check rendering without a camera.
 const ease = (t, a, b) => (t <= a ? 0 : t >= b ? 1 : 0.5 - 0.5 * Math.cos((Math.PI * (t - a)) / (b - a)));
-const FINGER_MASKS = [0, 1, 3, 7, 15, 31]; // 0..5 raised fingers
+const FINGER_MASKS = [0, 0b00010, 0b00110, 0b01110, 0b11110, 31]; // 0..5 raised fingers (thumb last: thumb alone is a special gesture)
 
 // Schematic hand for the skeleton overlay. Thumb (4) and index (8) tips sit on the inner side of the hand
 // (side +1: toward +x); `frame` (0..1) turns them into the "L" of the portal gesture: index up, thumb down.
-function demoPts(x, y, s, mask, side, frame) {
+function demoPts(x, y, s, mask, side, frame, roll = 0) {
   const pts = Array.from({ length: 21 }, () => ({ x, y }));
   pts[0] = { x, y: y + 0.5 * s };
   const finger = (base, kx, ky, up, len) => {
@@ -140,6 +158,17 @@ function demoPts(x, y, s, mask, side, frame) {
     const f = j / 4;
     pts[j] = { x: x + side * s * (0.12 + (tx - 0.12) * f), y: y + s * (0.35 + (ty - 0.35) * f) };
   }
+  // Roll: the whole hand turned in the screen plane (positive: clockwise on screen) about the palm centre.
+  if (roll) {
+    const c = Math.cos(roll);
+    const sn = Math.sin(roll);
+    for (const p of pts) {
+      const dx = p.x - x;
+      const dy = p.y - y;
+      p.x = x + dx * c - dy * sn;
+      p.y = y + dx * sn + dy * c;
+    }
+  }
   return pts;
 }
 
@@ -153,7 +182,7 @@ function demoHand(h, v, size, age) {
     size,
     fingers: popcount(h.mask),
     mask: h.mask,
-    pts: demoPts(h.x, h.y, size, h.mask, h.side, h.frame ?? 0),
+    pts: demoPts(h.x, h.y, size, h.mask, h.side, h.frame ?? 0, h.roll ?? 0),
     // Wrist and fingertip velocity: the hand really moves, a flick is a fast sideways motion of the whole hand.
     pvx: v.x,
     pvy: v.y,
@@ -170,18 +199,37 @@ function demoHand(h, v, size, age) {
   };
 }
 
-// Cycle (40 s), every hand moves continuously (no jumps between phases):
-//  0– 4  one hand drifting sideways, 0..5 raised fingers (prism shapes); turns over once at ~3 s
-//  4– 7  middle finger
-//  7–12.6 the second hand comes in, the hands are held together: solids for 0..5 fingers
-// 12.6–24.6 pulled apart into the portal, mandala levels 0..6
-// 24.6–35 the second hand leaves and comes back on the far side; three throws between the hands (roles swap)
-// 35–40 the catcher leaves: a throw with nobody to catch it comes back; the hand returns to the centre
-const CYCLE = 40;
+// Cycle (62.4 s), every hand moves continuously (no jumps between phases):
+//  0– 4    one hand drifting sideways, 0..5 raised fingers (prism shapes); turns over once at ~3 s
+//  4– 6.5  middle finger
+//  6.5–10.5 single-hand special gestures: thumb, thumb + pinky, index + pinky, pinky
+// 10.5–15  the sorcerer gesture (thumb + index + pinky): the Shield of the Seraphim, the hand sways and rolls
+// 15–24.5  the second hand comes in, the hands are held together: solids for 0..10 raised fingers (both hands)
+// 24.5–47  pulled apart into the portal: designs 0..7 (lead hand's middle / ring / pinky), each at two levels
+//          (the tool hand's middle / ring / pinky count)
+// 47–62.4  the second hand leaves and comes back on the far side; three throws between the hands (roles swap),
+//          then the catcher leaves: a throw with nobody to catch it comes back; the hand returns to the centre
+const SPECIALS = [0b00001, 0b10001, 0b10010, 0b10000];
+const SORCERER = 0b10011;
+const P0 = 24.5; // portal phase
+const SPELL_AT = 26.1; // first design shown once the portal is open
+const SPELL_DUR = 2.6;
+const SPELL_LEVELS = [0, 1, 2, 1, 0, 2, 1, 2]; // first half of each design's slot; the second half is level 3
+const T0 = SPELL_AT + 8 * SPELL_DUR + 0.1; // throw phase (47)
+const CYCLE = T0 + 15.4;
 const FLICK = { at: 0.4, out: 0.15, hold: 0.1, back: 0.5, reach: 150 }; // a ~1500 px/s sideways flick
 let demoSwapped = false;
 const demoBorn = {}; // id -> time (s) the hand came into view
 let flicker = null; // { slot, right, dir }: the hand flicking in the current throw slot (fixed for the whole slot)
+const levelBits = (n) => [0, 0b00100, 0b01100, 0b11100][n];
+
+/** Portal design and level the demo shows at cycle time c (null before the designs start). */
+function demoSpell(c) {
+  if (c < SPELL_AT || c >= T0) return null;
+  const i = Math.min(7, Math.floor((c - SPELL_AT) / SPELL_DUR));
+  const late = c - SPELL_AT - i * SPELL_DUR > SPELL_DUR / 2;
+  return { spell: i, level: late ? 3 : SPELL_LEVELS[i] };
+}
 
 function demoPose(t) {
   const { W, H } = view;
@@ -197,25 +245,38 @@ function demoPose(t) {
     lead = { x: cx + sway, y: cy, mask: FINGER_MASKS[Math.min(5, Math.floor(c / 0.65))], side: 1, id: 'L' };
     // Turn the hand over and back once: the figure spins with it and keeps turning for a while.
     if (c > 2.5 && c < 3.2) lead.flip = 8 * Math.sin(((c - 2.5) / 0.7) * Math.PI);
-  } else if (c < 7) {
+  } else if (c < 6.5) {
     lead = { x: cx, y: cy, mask: 4, side: 1, id: 'L' };
-  } else if (c < 12.6) {
-    const e = ease(c, 7, 7.8);
-    const mask = FINGER_MASKS[clamp(Math.floor((c - 8.1) / 0.75), 0, 5)];
-    lead = { x: cx - 0.45 * s * e, y: cy, mask, side: 1, id: 'L' };
-    tool = { x: cx + (2.3 - 1.85 * e) * s, y: cy, mask: 0, side: -1, id: 'R' };
-  } else if (c < 24.6) {
-    const e = ease(c, 12.6, 14);
+  } else if (c < 10.5) {
+    lead = { x: cx, y: cy, mask: SPECIALS[Math.min(3, Math.floor(c - 6.5))], side: 1, id: 'L' };
+  } else if (c < 15) {
+    // The shield follows the palm and turns with the wrist.
+    const k = (c - 10.5) / 4.5;
+    const env = Math.sin(k * Math.PI);
+    lead = {
+      x: cx + Math.sin(k * Math.PI * 2) * env * Math.min(W * 0.18, 160),
+      y: cy - env * s * 0.4,
+      mask: c < 14.4 ? SORCERER : 0,
+      side: 1,
+      roll: 0.45 * Math.sin(k * Math.PI * 3) * env,
+      id: 'L',
+    };
+  } else if (c < P0) {
+    const e = ease(c, 15, 15.8);
+    const n = clamp(Math.floor((c - 16.1) / 0.75), 0, 10); // raised fingers on both hands
+    lead = { x: cx - 0.45 * s * e, y: cy, mask: FINGER_MASKS[Math.min(n, 5)], side: 1, id: 'L' };
+    tool = { x: cx + (2.3 - 1.85 * e) * s, y: cy, mask: FINGER_MASKS[Math.max(n - 5, 0)], side: -1, id: 'R' };
+  } else if (c < T0) {
+    const e = ease(c, P0, P0 + 1.4);
     const half = (0.45 + 1.15 * e) * s;
-    // Extra raised fingers (middle, ring, pinky; lead first) set the mandala level.
-    const level = clamp(Math.floor((c - 14.2) / 1.45), 0, 6);
-    const extra = (n) => 0b00011 | ((0b11100 >> (3 - n)) & 0b11100);
-    const open = 2 * half > CFG.portalAt * s; // until the portal opens the hands still show the torus
-    lead = { x: cx - half, y: cy, mask: open ? extra(Math.min(level, 3)) : 31, side: 1, frame: e, id: 'L' };
-    tool = { x: cx + half, y: cy, mask: open ? extra(Math.max(level - 3, 0)) : 0, side: -1, frame: e, id: 'R' };
+    const open = 2 * half > CFG.portalAt * s; // until the portal opens the hands still show the tesseract
+    const sp = demoSpell(c) ?? { spell: 0, level: 0 };
+    // Thumb + index make the frame; the lead hand's other fingers pick the design, the tool hand's count the level.
+    lead = { x: cx - half, y: cy, mask: open ? 0b00011 | (sp.spell << 2) : 31, side: 1, frame: e, id: 'L' };
+    tool = { x: cx + half, y: cy, mask: open ? 0b00011 | levelBits(sp.level) : 31, side: -1, frame: e, id: 'R' };
   } else {
     // The lead hand moves out to the left; the other hand shows up on the right.
-    const settle = ease(c, 24.6, 25.6);
+    const settle = ease(c, T0, T0 + 1);
     const home = (right) => cx + (right ? far : -far + (far - 1.6 * s) * (1 - settle));
     const L = { x: home(false), y: cy, mask: 31, side: 1, id: 'L' };
     const R = { x: home(true), y: cy, mask: 31, side: -1, id: 'R' };
@@ -228,28 +289,28 @@ function demoPose(t) {
     }
     const [a, b] = demoSwapped ? [R, L] : [L, R];
     lead = a;
-    if (c >= 25.6 && c < 35) tool = b;
+    if (c >= T0 + 1 && c < T0 + 10.4) tool = b;
     // At the end the hand drifts back to the centre, where the next cycle starts.
-    if (c >= 37.8) lead.x += (cx - lead.x) * ease(c, 37.8, 39.6);
-    if (c >= 39.6) lead.mask = 0;
+    if (c >= T0 + 13.2) lead.x += (cx - lead.x) * ease(c, T0 + 13.2, T0 + 15);
+    if (c >= T0 + 15) lead.mask = 0;
   }
   return { lead, tool, s };
 }
 
 function demoInput(t) {
   const c = ((t % CYCLE) + CYCLE) % CYCLE;
-  if (c < 25.6) {
+  if (c < T0 + 1) {
     demoSwapped = false;
     flicker = null;
-  } else if (c < 38) {
-    // Throw slots start at 26, 29, 32 (to the other hand) and 35 (nobody to catch it).
-    const slot = 26 + 3 * Math.floor((c - 26) / 3);
-    if (c >= 26 && flicker?.slot !== slot) {
+  } else if (c < T0 + 13.4) {
+    // Throw slots start at T0 + 1.4, + 4.4, + 7.4 (to the other hand) and + 10.4 (nobody to catch it).
+    const slot = T0 + 1.4 + 3 * Math.floor((c - T0 - 1.4) / 3);
+    if (c >= T0 + 1.4 && flicker?.slot !== slot) {
       const right = demoSwapped;
       const x = right ? view.W / 2 + Math.min(330, view.W * 0.36) : view.W / 2 - Math.min(330, view.W * 0.36);
       let dir = right ? -1 : 1; // toward the other hand
       // Nobody to catch it: toward the near screen edge if there is room for the flick, else across the screen.
-      if (slot >= 35 && (right ? view.W - x : x) > FLICK.reach * 1.5) dir = -dir;
+      if (slot >= T0 + 10.4 - 1e-6 && (right ? view.W - x : x) > FLICK.reach * 1.5) dir = -dir;
       flicker = { slot, right, dir };
     }
   }
@@ -265,6 +326,21 @@ function demoInput(t) {
   const lead = demoHand(now.lead, vel(now.lead, prev.lead), now.s, age(now.lead));
   const tool = now.tool && demoHand(now.tool, vel(now.tool, prev.tool), now.s, age(now.tool));
   return { lead, tool, hands: [lead, tool].filter(Boolean).map((hd) => hd.pts) };
+}
+
+// HUD line: the mode and what it shows (Russian).
+function hudName(lead) {
+  const names = shapes.SHAPE_NAMES ?? {};
+  if (S.flight) return { out: 'бросок: летит', home: 'бросок: к другой руке', back: 'бросок: возвращается' }[S.flight.phase];
+  if (S.mode === 'portal') {
+    const d = PORTAL_DESIGNS[clamp(S.portalSpell ?? 0, 0, PORTAL_DESIGNS.length - 1)];
+    return `портал: ${d.name} · уровень ${clamp(S.portalLevel, 0, 3)}`;
+  }
+  if (S.shield?.vis > 0.3) return 'щит Серафима';
+  const name = names[S.solidKey ?? `prism${lead.fingers}`] ?? '';
+  if (S.mode === 'joined') return `руки вместе: ${name}`;
+  if (S.solidKey === MIDDLE) return name || 'средний палец';
+  return `одна рука: ${name}`;
 }
 
 async function openCamera() {
@@ -283,6 +359,16 @@ async function main() {
     read = (now, t) => demoInput(t);
     // Idempotent: the hand with this id leads now (the right one, 'R', means swapped).
     sim.swapHands = (id) => (demoSwapped = id === undefined ? !demoSwapped : id === 'R');
+    // Read-only peek for visual checks of the demo (sim time, mode, segment counts).
+    window.__dbg = () => ({
+      t: simTime,
+      mode: S.mode,
+      spell: S.portalSpell,
+      level: S.portalLevel,
+      shield: S.shield?.vis ?? 0,
+      segs: portal.stats.segs + shield.stats.segs,
+      sparks: sparks.alive,
+    });
   } else {
     const [, tracker] = await Promise.all([openCamera(), startTracking(video, view)]);
     read = tracker.read;
@@ -315,14 +401,7 @@ async function main() {
     if (frame++ % 10 === 0) {
       statusEl.style.opacity = input.lead ? 0 : 1;
       statusEl.textContent = 'Покажите руку в кадр';
-      const modeName = S.flight
-        ? { out: 'бросок: летит', home: 'бросок: к другой руке', back: 'бросок: возвращается' }[S.flight.phase]
-        : S.mode === 'single' && S.solidKey === MIDDLE
-          ? 'средний палец'
-          : { single: 'одна рука', joined: 'руки вместе', portal: `портал, уровень ${S.portalLevel}` }[S.mode];
-      hud.textContent = input.lead
-        ? `${modeName} · ведущая рука: ${input.lead.fingers} · вторая рука: ${input.tool ? `масштаб ×${S.scale.toFixed(2)}` : 'нет'} · ${fps.toFixed(0)} fps`
-        : `${fps.toFixed(0)} fps`;
+      hud.textContent = input.lead ? `${hudName(input.lead)} · ${fps.toFixed(0)} fps` : `${fps.toFixed(0)} fps`;
     }
   }
   requestAnimationFrame(loop);
